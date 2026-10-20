@@ -70,8 +70,10 @@ class ProfileSetupAvatarEditor extends HookConsumerWidget {
             busy.value = true;
             error.value = false;
             try {
-              final result = mode.value == ProfileAvatarMode.animated
-                  ? await prepare.value?.call()
+              final result =
+                  mode.value == ProfileAvatarMode.animated &&
+                      prepare.value != null
+                  ? await prepare.value!()
                   : draft.value;
               if (context.mounted && result != null) {
                 if (onFinished != null) {
@@ -103,6 +105,7 @@ class ProfileSetupAvatarEditor extends HookConsumerWidget {
                 )
               : IconButton(
                   onPressed: close,
+                  tooltip: 'Back to profile',
                   icon: const Icon(Icons.arrow_back),
                 ),
           actions: [
@@ -151,6 +154,7 @@ class ProfileSetupAvatarEditor extends HookConsumerWidget {
                         onModeChanged: (value) {
                           mode.value = value;
                           draft.value = null;
+                          prepare.value = null;
                         },
                         onDraftChanged: (value) => draft.value = value,
                         onAnimatedPrepareChanged: (value) {

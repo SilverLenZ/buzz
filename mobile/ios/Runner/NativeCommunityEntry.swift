@@ -317,6 +317,9 @@ private final class NativeCommunityEntryController: UIViewController, UITextFiel
       self.setBusy(false)
       self.status.text = result["error"] as? String
       self.status.isHidden = self.status.text == nil
+      if let error = self.status.text {
+        UIAccessibility.post(notification: .announcement, argument: error)
+      }
       self.navigationController?.sheetPresentationController?.invalidateDetents()
       if result["joined"] as? Bool == true {
         self.input.text = nil

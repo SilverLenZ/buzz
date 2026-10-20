@@ -432,6 +432,7 @@ class ProfileAvatarEditor extends HookConsumerWidget {
                   onPrepareChanged: onAnimatedPrepareChanged,
                 ) ??
                 AnimatedAvatarCapture(
+                  previewKey: previewKey,
                   height: modeHeight,
                   onPrepareChanged: onAnimatedPrepareChanged,
                   disposalBarrier: cameraDisposal.value,

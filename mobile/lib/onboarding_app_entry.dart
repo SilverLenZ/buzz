@@ -120,6 +120,7 @@ class OnboardingAppEntry extends HookConsumerWidget {
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop &&
             (existingUser.value ||
+                creating.value ||
                 enteringCommunityLink.value ||
                 inlineSetup)) {
           back();

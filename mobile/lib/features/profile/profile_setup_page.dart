@@ -15,6 +15,7 @@ import '../../shared/theme/theme.dart';
 import 'profile_avatar_sheet_app.dart';
 import '../../shared/widgets/modal_presentation.dart';
 import 'profile_avatar_draft.dart';
+import '../../shared/widgets/playing_avatar_image.dart';
 import 'profile_setup_avatar_editor.dart';
 
 /// One optional profile sheet for onboarding and existing-community entry.
@@ -31,13 +32,14 @@ class ProfileSetupPage extends HookConsumerWidget {
       final session = ++_nextSession;
       var active = true;
       var name = '';
-      ProfileAvatarDraft? avatar;
-      ModalRoute<dynamic>? flutterRoute;
+      final avatar = ValueNotifier<ProfileAvatarDraft?>(null);
+      ModalRoute<dynamic>? profileRoute;
+      ModalRoute<dynamic>? editorRoute;
       bool current() =>
           active && context.mounted && flow.stage == HostedFlowStage.profile;
       Future<void> save() async {
         if (!current()) return;
-        final draft = avatar;
+        final draft = avatar.value;
         final service = draft == null
             ? null
             : ref.read(mediaUploadServiceProvider);
@@ -49,7 +51,6 @@ class ProfileSetupPage extends HookConsumerWidget {
 
       Future<void> editAvatar() async {
         if (!current()) return;
-        final parentRoute = flutterRoute;
         final result = await showBuzzModalBottomSheet<ProfileAvatarDraft>(
           context: context,
           useRootNavigator: true,
@@ -60,16 +61,16 @@ class ProfileSetupPage extends HookConsumerWidget {
           isDismissible: false,
           enableDrag: false,
           builder: (sheetContext) {
-            flutterRoute = ModalRoute.of(sheetContext);
+            editorRoute = ModalRoute.of(sheetContext);
             return SizedBox(
               height: MediaQuery.sizeOf(sheetContext).height * .94,
-              child: ProfileSetupAvatarEditor(initialDraft: avatar),
+              child: ProfileSetupAvatarEditor(initialDraft: avatar.value),
             );
           },
         );
-        flutterRoute = null;
-        flutterRoute = parentRoute;
-        if (current() && result != null) avatar = result;
+        if (!current()) return;
+        editorRoute = null;
+        if (result != null) avatar.value = result;
       }
 
       Future<void> fallback() async {
@@ -84,8 +85,9 @@ class ProfileSetupPage extends HookConsumerWidget {
           isScrollControlled: true,
           useSafeArea: true,
           builder: (sheetContext) {
-            flutterRoute = ModalRoute.of(sheetContext);
+            profileRoute = ModalRoute.of(sheetContext);
             return _ProfileSetupForm(
+              avatar: avatar,
               onName: (value) => name = value,
               editAvatar: editAvatar,
               save: save,
@@ -93,7 +95,8 @@ class ProfileSetupPage extends HookConsumerWidget {
             );
           },
         );
-        flutterRoute = null;
+        if (!current()) return;
+        profileRoute = null;
         if (current()) flow.finishProfile();
       }
 
@@ -108,16 +111,16 @@ class ProfileSetupPage extends HookConsumerWidget {
           }
           switch (call.method) {
             case 'avatarDraft':
-              avatar = decodeProfileAvatarDraft(
+              avatar.value = decodeProfileAvatarDraft(
                 (call.arguments as Map)['draft'] as Map?,
               );
-              final emoji = avatar is ProfileUrlAvatarDraft
+              final emoji = avatar.value is ProfileUrlAvatarDraft
                   ? parseEmojiAvatarDataUrl(
-                      (avatar as ProfileUrlAvatarDraft).url,
+                      (avatar.value as ProfileUrlAvatarDraft).url,
                     )
                   : null;
               return {
-                'avatar': switch (avatar) {
+                'avatar': switch (avatar.value) {
                   ProfileImageAvatarDraft(:final bytes) => bytes,
                   ProfileAnimatedAvatarDraft(:final poster) => poster,
                   _ => null,
@@ -140,13 +143,15 @@ class ProfileSetupPage extends HookConsumerWidget {
 
         try {
           while (current()) {
-            final Uint8List? bytes = switch (avatar) {
+            final Uint8List? bytes = switch (avatar.value) {
               ProfileImageAvatarDraft(:final bytes) => bytes,
               ProfileAnimatedAvatarDraft(:final poster) => poster,
               _ => null,
             };
-            final emoji = avatar is ProfileUrlAvatarDraft
-                ? parseEmojiAvatarDataUrl((avatar as ProfileUrlAvatarDraft).url)
+            final emoji = avatar.value is ProfileUrlAvatarDraft
+                ? parseEmojiAvatarDataUrl(
+                    (avatar.value as ProfileUrlAvatarDraft).url,
+                  )
                 : null;
             final action = await _channel.invokeMethod<String>('present', {
               'session': session,
@@ -190,10 +195,13 @@ class ProfileSetupPage extends HookConsumerWidget {
                 .catchError((Object _) {}),
           );
         }
-        final route = flutterRoute;
+        final routes = [editorRoute, profileRoute];
+        avatar.dispose();
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (route != null && route.isActive) {
-            route.navigator?.removeRoute(route);
+          for (final route in routes) {
+            if (route != null && route.isActive) {
+              route.navigator?.removeRoute(route);
+            }
           }
         });
       };
@@ -204,17 +212,20 @@ class ProfileSetupPage extends HookConsumerWidget {
 
 class _ProfileSetupForm extends HookWidget {
   const _ProfileSetupForm({
+    required this.avatar,
     required this.onName,
     required this.editAvatar,
     required this.save,
     required this.skip,
   });
+  final ValueNotifier<ProfileAvatarDraft?> avatar;
   final ValueChanged<String> onName;
   final Future<void> Function() editAvatar;
   final Future<void> Function() save;
   final VoidCallback skip;
   @override
   Widget build(BuildContext context) {
+    final draft = useValueListenable(avatar);
     final name = useTextEditingController();
     useListenable(name);
     final busy = useState(false);
@@ -234,7 +245,22 @@ class _ProfileSetupForm extends HookWidget {
           children: [
             IconButton(
               onPressed: busy.value ? null : editAvatar,
-              icon: const Icon(Icons.add_a_photo_outlined),
+              icon: switch (draft) {
+                ProfileImageAvatarDraft(:final bytes) => CircleAvatar(
+                  radius: 32,
+                  backgroundImage: MemoryImage(bytes),
+                ),
+                ProfileAnimatedAvatarDraft(:final poster) => CircleAvatar(
+                  radius: 32,
+                  backgroundImage: MemoryImage(poster),
+                ),
+                ProfileUrlAvatarDraft(:final url) => PlayingAvatarImage(
+                  imageUrl: url,
+                  radius: 32,
+                  fallback: const Icon(Icons.add_a_photo_outlined),
+                ),
+                null => const Icon(Icons.add_a_photo_outlined),
+              },
               iconSize: 64,
               tooltip: 'Add profile photo',
             ),

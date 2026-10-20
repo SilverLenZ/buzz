@@ -18,13 +18,17 @@ final class NativeProfileSetupCoordinator: NSObject, UIAdaptivePresentationContr
   private var previousDetent: UISheetPresentationController.Detent.Identifier?
   private var editorAvatarRect: CGRect?
   private var avatarDraft: [String: Any]?
+  private let scheduleEditorWatchdog: (@escaping () -> Void) -> Void
   private let startEditorEngine: (FlutterEngine) -> Bool
   private let configureEditorEngine: (FlutterEngine) -> Void
 
 
-  init(messenger: FlutterBinaryMessenger, startEditorEngine: @escaping (FlutterEngine) -> Bool = {
+  init(messenger: FlutterBinaryMessenger, scheduleEditorWatchdog: @escaping (@escaping () -> Void) -> Void = {
+         DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: $0)
+       }, startEditorEngine: @escaping (FlutterEngine) -> Bool = {
          $0.run(withEntrypoint: "profileAvatarEditorMain", libraryURI: "package:buzz/features/profile/profile_avatar_sheet_app.dart")
        }, configureEditorEngine: @escaping (FlutterEngine) -> Void) {
+    self.scheduleEditorWatchdog = scheduleEditorWatchdog
     self.startEditorEngine = startEditorEngine
     self.configureEditorEngine = configureEditorEngine
     channel = FlutterMethodChannel(name: "buzz/profile_setup", binaryMessenger: messenger)
@@ -96,10 +100,12 @@ final class NativeProfileSetupCoordinator: NSObject, UIAdaptivePresentationContr
     }
     let editorChannel = FlutterMethodChannel(name: "buzz/profile_avatar_sheet", binaryMessenger: engine.binaryMessenger)
     avatarChannel = editorChannel
+    var ready = false
     var finishing = false
-    editorChannel.setMethodCallHandler { [weak self, weak controller] call, result in
-      guard let self, self.session == session, let controller else { result(nil); return }
+    editorChannel.setMethodCallHandler { [weak self, weak controller, weak engine] call, result in
+      guard let self, let engine, self.session == session, self.avatarEngine === engine, let controller else { result(nil); return }
       if call.method == "ready", let rect = call.arguments as? [String: NSNumber], let editor = self.avatarController {
+        ready = true
         let target = CGRect(x: rect["x"]?.doubleValue ?? 0, y: rect["y"]?.doubleValue ?? 0, width: rect["width"]?.doubleValue ?? 220, height: rect["height"]?.doubleValue ?? 220)
         self.editorAvatarRect = target
         let destination = editor.view.convert(target, to: navigation.view)
@@ -177,9 +183,13 @@ final class NativeProfileSetupCoordinator: NSObject, UIAdaptivePresentationContr
     navigation.pushViewController(editor, animated: false)
     if let cover { cover.frame = navigation.view.bounds; navigation.view.addSubview(cover); transitionCover = cover }
     if let (snapshot, frame) = sourceAvatar { snapshot.frame = frame; navigation.view.addSubview(snapshot); transitionAvatar = snapshot }
-    // A failed editor frame must not leave an opaque snapshot blocking dismissal.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self, weak engine] in
-      guard let self, let engine, self.session == session, self.avatarEngine === engine, self.transitionCover === cover else { return }; self.clearTransition()
+    // Recover the whole sheet when Dart never delivers the editor's first frame.
+    scheduleEditorWatchdog { [weak self, weak engine, weak controller] in
+      guard let self, let engine, self.session == session,
+            self.avatarEngine === engine, !ready, !finishing else { return }
+      navigation.setNavigationBarHidden(false, animated: false)
+      navigation.popViewController(animated: false)
+      self.restoreProfileSheet(controller)
     }
     navigation.interactivePopGestureRecognizer?.isEnabled = false
 
@@ -345,6 +355,7 @@ private final class NativeProfileSetupController: UIViewController, UITextFieldD
       guard let self else { return }
       if response["saved"] as? Bool == true { self.finish?("saved"); return }
       self.status.text = "Could not save your profile. Try again or skip."; self.status.isHidden = false
+      UIAccessibility.post(notification: .announcement, argument: self.status.text)
       self.name.isEnabled = true; self.controls.forEach { $0.isEnabled = true }; self.updateName(); self.navigationController?.isModalInPresentation = false; self.navigationItem.rightBarButtonItem?.isEnabled = true; self.submit.configuration?.showsActivityIndicator = false
     }
   }

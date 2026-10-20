@@ -5,6 +5,11 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:buzz/features/profile/profile_setup_page.dart';
+import 'package:buzz/features/profile/profile_setup_avatar_editor.dart';
+import 'package:buzz/features/profile/profile_avatar_draft.dart';
+import 'package:buzz/shared/emoji/emoji_avatar.dart';
+import 'package:buzz/shared/widgets/playing_avatar_image.dart';
+import 'package:buzz/features/pairing/pairing_page.dart';
 import 'package:buzz/onboarding_app_entry.dart';
 import 'package:buzz/shared/auth/auth.dart';
 import 'package:buzz/shared/hosted/builderlab_account.dart';
@@ -51,6 +56,73 @@ void main() {
               !HostedEnvironment.requiresAuth('one.communities.buzz.xyz')),
     );
   }
+
+  journey('system Back leaves community creation', (tester, f) async {
+    await f.initialize();
+    await f.mount(tester);
+    await f.tap(tester, 'Create a community');
+    expect(
+      tester.widget<PairingPage>(find.byType(PairingPage)).creatingCommunity,
+      isTrue,
+    );
+    await tester.binding.handlePopRoute();
+    await f.settle(tester);
+    expect(
+      tester.widget<PairingPage>(find.byType(PairingPage)).creatingCommunity,
+      isFalse,
+    );
+    expect(find.text('Create a community').hitTestable(), findsOneWidget);
+  });
+
+  journey('retiring profile setup removes both profile and avatar routes', (
+    tester,
+    f,
+  ) async {
+    await f.initialize();
+    f.rows.add(f.row('one'));
+    await f.mount(tester);
+    await f.tap(tester, 'Continue with Builderlab');
+    await tester.tap(find.byTooltip('Add profile photo'));
+    await f.settle(tester);
+    expect(find.byType(ProfileSetupAvatarEditor), findsOneWidget);
+    await f.link(tester, 'two');
+    expect(
+      find.byType(ProfileSetupAvatarEditor, skipOffstage: false),
+      findsNothing,
+    );
+    expect(find.text('Set up your profile', skipOffstage: false), findsNothing);
+    expect(f.profileWrites, isEmpty);
+  });
+
+  journey('fallback profile previews the accepted draft before saving', (
+    tester,
+    f,
+  ) async {
+    await f.initialize();
+    f.rows.add(f.row('one'));
+    await f.mount(tester);
+    await f.tap(tester, 'Continue with Builderlab');
+    await tester.tap(find.byTooltip('Add profile photo'));
+    await f.settle(tester);
+    final url = emojiAvatarDataUrl('🐝', 0xFFFFE75C);
+    Navigator.of(
+      tester.element(find.byType(ProfileSetupAvatarEditor)),
+    ).pop(ProfileUrlAvatarDraft(url));
+    await f.settle(tester);
+    expect(
+      tester
+          .widget<PlayingAvatarImage>(find.byType(PlayingAvatarImage))
+          .imageUrl,
+      url,
+    );
+    await tester.enterText(
+      find.byType(TextField).hitTestable(),
+      'Draft Person',
+    );
+    await f.tap(tester, 'Continue');
+    expect(f.profileWrites, ['Draft Person']);
+    expect(f.profileAvatars, [url]);
+  });
 
   journey(
     'QR credentials enter without an account when domain is not required',
