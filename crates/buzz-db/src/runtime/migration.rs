@@ -709,7 +709,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 67);
+        assert_eq!(migrations.len(), 68);
         assert_eq!(migrations[64].version, 65);
         let retire_ttl = strip_sql_comments(migrations[64].sql.as_str());
         for statement in [
@@ -766,6 +766,13 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("ADD COLUMN join_role TEXT NOT NULL DEFAULT 'member'"));
+        assert_eq!(migrations[67].version, 68);
+        let bot_role = strip_sql_comments(migrations[67].sql.as_str());
+        assert!(bot_role
+            .trim_start()
+            .starts_with("SET LOCAL lock_timeout = '5s';"));
+        assert!(bot_role.contains("SET role = 'bot'"));
+        assert!(bot_role.contains("SET role = 'member'"));
         assert_eq!(migrations[48].version, 49);
         assert_eq!(migrations[49].version, 50);
         assert_eq!(migrations[50].version, 51);

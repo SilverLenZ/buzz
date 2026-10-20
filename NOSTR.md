@@ -100,6 +100,23 @@ relay to specific external Nostr identities without granting full access.
   SELECT encode(pubkey, 'hex'), added_at, note FROM pubkey_allowlist;
   ```
 
+### The bot role
+
+`bot` is a label, not a permission tier. It has the same permissions as
+`member`, and the relay chooses between the two:
+
+- When an add or role change ends at `member` or `bot`, the relay stores
+  `bot` if the key has a recorded agent owner, and `member` otherwise. It
+  ignores which of the two the client asked for. Asking for the other one is
+  not a role change.
+- An agent owner is recorded once, by the first NIP-OA authentication, and
+  never changes. When it is recorded, the relay changes that key's active
+  `member` rows to `bot` and republishes the affected kind:39002 rosters.
+- `owner`, `admin` and `guest` are stored as asked.
+
+Clients should send `member` for an ordinary member and treat a `bot` role as
+"member, owned agent".
+
 ### Announce channels
 
 Roles have the same permissions in every channel. A channel's settings

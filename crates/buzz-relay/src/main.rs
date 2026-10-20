@@ -1152,6 +1152,30 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     }
     step.finish();
 
+    // Make rosters follow the `member`/`bot` rows: migration 0068 changed
+    // rows without republishing, and a relay can stop between recording an
+    // agent owner and republishing that agent's rosters.
+    let mut step = StepTimer::start(StartupStep::RoleRosterReconcile);
+    match buzz_relay::handlers::side_effects::reconcile_ordinary_role_rosters(&state).await {
+        Ok(summary) => {
+            if summary.failed > 0 {
+                step.degrade();
+            }
+            if summary.repaired > 0 || summary.failed > 0 {
+                info!(
+                    count = summary.repaired,
+                    failed = summary.failed,
+                    "member/bot channel rosters reconciled on startup"
+                );
+            }
+        }
+        Err(error) => {
+            step.degrade();
+            tracing::warn!(%error, "member/bot channel roster startup reconciliation failed")
+        }
+    }
+    step.finish();
+
     // Emit kind:39000/39002 discovery events for channels that exist in the DB
     // but don't have corresponding events (e.g. seeded via direct SQL inserts).
     // Only runs when BUZZ_RECONCILE_CHANNELS=true (dev/CI environments).

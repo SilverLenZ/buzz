@@ -6,6 +6,7 @@ use buzz_core::CommunityId;
 use buzz_datastore_tracing::datastore_span;
 use sqlx::PgPool;
 use sqlx::Row;
+use uuid::Uuid;
 
 /// A user's profile fields.
 #[derive(Debug, Clone)]
@@ -330,6 +331,11 @@ pub async fn search_users(
 /// Returns Ok(true) if ownership was set, Ok(false) if an owner already exists
 /// (caller should check whether the existing owner matches). Returns Err if the
 /// agent pubkey doesn't exist in the users table.
+///
+/// Recording the owner also converts the agent's active `member` rows to
+/// `bot`; see [`AgentOwnerRecord`]. Callers that publish rosters use
+/// [`Db::set_agent_owner_for_authorization`], which returns the changed
+/// channels.
 pub async fn set_agent_owner(
     pool: &PgPool,
     community_id: CommunityId,
@@ -344,15 +350,28 @@ pub async fn set_agent_owner(
         crate::observability::WriterOperation::EventWrite,
     )
     .await
+    .map(|record| record.recorded)
 }
 
-async fn set_agent_owner_with_operation(
+/// The result of [`set_agent_owner`]'s first-mint-wins owner write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentOwnerRecord {
+    /// Whether this call recorded the owner. `false` means an owner was
+    /// already recorded and nothing changed.
+    pub recorded: bool,
+    /// Channels whose active `member` row for the agent became `bot` in the
+    /// same transaction. Their kind:39002 rosters are now stale; the caller
+    /// republishes them.
+    pub converted_channels: Vec<Uuid>,
+}
+
+pub(crate) async fn set_agent_owner_with_operation(
     pool: &PgPool,
     community_id: CommunityId,
     agent_pubkey: &[u8],
     owner_pubkey: &[u8],
     operation: crate::observability::WriterOperation,
-) -> Result<bool> {
+) -> Result<AgentOwnerRecord> {
     let mut tx = crate::begin_community_write_transaction(pool, community_id, operation).await?;
     // Conditional UPDATE: only set owner if currently NULL. This makes
     // "first mint wins" atomic — no TOCTOU race between concurrent mints.
@@ -380,10 +399,32 @@ async fn set_agent_owner_with_operation(
         }
         // Row exists but owner already set — return false (not an error).
         tx.commit().await?;
-        return Ok(false);
+        return Ok(AgentOwnerRecord::default());
     }
+    // The key is now an owned agent, so its ordinary role is `bot`. The
+    // UPDATE above holds the users row lock, which
+    // `channel_members::ordinary_member_role_tx` waits on, so no concurrent
+    // add can store `member` for this key after this conversion.
+    //
+    // This deliberately does not take the channels' membership locks: taking
+    // them after the users row lock would invert `add_member`'s lock order. A
+    // roster publish that read `member` just before this commit is refused by
+    // the migration 0032 roster fence; the caller's republish of
+    // `converted_channels` then writes the correct roster.
+    let converted_channels: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE channel_members SET role = 'bot' \
+         WHERE community_id = $1 AND pubkey = $2 AND role = 'member' AND removed_at IS NULL \
+         RETURNING channel_id",
+    )
+    .bind(community_id.as_uuid())
+    .bind(agent_pubkey)
+    .fetch_all(tx.conn())
+    .await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(AgentOwnerRecord {
+        recorded: true,
+        converted_channels,
+    })
 }
 
 /// Get the channel_add_policy and agent_owner_pubkey for a user.
@@ -613,7 +654,7 @@ impl Db {
         community_id: CommunityId,
         agent_pubkey: &[u8],
         owner_pubkey: &[u8],
-    ) -> Result<bool> {
+    ) -> Result<AgentOwnerRecord> {
         set_agent_owner_with_operation(
             &self.pool,
             community_id,

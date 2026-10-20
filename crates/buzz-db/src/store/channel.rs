@@ -26,10 +26,11 @@ pub use buzz_core::channel::{
 pub use crate::channel_members::{
     add_member, get_accessible_channel_ids, get_accessible_channels, get_bot_members,
     get_member_count, get_member_counts_bulk, get_member_role, get_members, get_members_bulk,
-    get_users_bulk, is_member, list_large_channel_rosters_needing_reconciliation,
-    lock_member_snapshot, membership_pairs, remove_member, verify_channel_roster_fence_behavior,
-    verify_channel_roster_fence_catalog, AccessibleChannel, BotChannelEntry, BotMemberRecord,
-    ChannelIdentity, LargeChannelRoster, LockedMemberSnapshot, MemberRecord, UserRecord,
+    get_users_bulk, is_member, list_channel_rosters_with_stale_ordinary_roles,
+    list_large_channel_rosters_needing_reconciliation, lock_member_snapshot, membership_pairs,
+    remove_member, verify_channel_roster_fence_behavior, verify_channel_roster_fence_catalog,
+    AccessibleChannel, BotChannelEntry, BotMemberRecord, ChannelIdentity, LargeChannelRoster,
+    LockedMemberSnapshot, MemberRecord, StaleRoleRoster, UserRecord,
 };
 
 /// A channel row as returned from the database.
@@ -413,16 +414,20 @@ async fn insert_channel_rows(
                     member.len()
                 )));
             }
+            let role =
+                crate::channel_members::ordinary_member_role_tx(tx.conn(), community_id, member)
+                    .await?;
             sqlx::query(
                 r#"
                 INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by)
-                VALUES ($1, $2, $3, 'member', $4)
+                VALUES ($1, $2, $3, $4::member_role, $5)
                 ON CONFLICT (community_id, channel_id, pubkey) DO NOTHING
                 "#,
             )
             .bind(community_id.as_uuid())
             .bind(channel_id)
             .bind(member)
+            .bind(role.as_str())
             .bind(created_by)
             .execute(tx.conn())
             .await?;

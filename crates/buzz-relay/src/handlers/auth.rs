@@ -1952,15 +1952,18 @@ mod tests {
                     .await
                     .expect("seed user");
             }
-            assert!(state
-                .db
-                .set_agent_owner_for_authorization(
-                    community,
-                    agent.public_key().as_bytes(),
-                    prior_owner.public_key().as_bytes(),
-                )
-                .await
-                .expect("seed prior owner"));
+            assert!(
+                state
+                    .db
+                    .set_agent_owner_for_authorization(
+                        community,
+                        agent.public_key().as_bytes(),
+                        prior_owner.public_key().as_bytes(),
+                    )
+                    .await
+                    .expect("seed prior owner")
+                    .recorded
+            );
             let auth_tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "")
                 .expect("sign NIP-OA credential");
             let auth_tag: Vec<String> = serde_json::from_str(&auth_tag).expect("tag JSON");
@@ -2011,15 +2014,18 @@ mod tests {
                     .await
                     .expect("seed user");
             }
-            assert!(state
-                .db
-                .set_agent_owner_for_authorization(
-                    community,
-                    stored.public_key().as_bytes(),
-                    owner.public_key().as_bytes(),
-                )
-                .await
-                .expect("seed stored owner link"));
+            assert!(
+                state
+                    .db
+                    .set_agent_owner_for_authorization(
+                        community,
+                        stored.public_key().as_bytes(),
+                        owner.public_key().as_bytes(),
+                    )
+                    .await
+                    .expect("seed stored owner link")
+                    .recorded
+            );
             let auth_tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &tagged.public_key(), "")
                 .expect("sign NIP-OA credential");
             let auth_tag: Vec<String> = serde_json::from_str(&auth_tag).expect("tag JSON");
