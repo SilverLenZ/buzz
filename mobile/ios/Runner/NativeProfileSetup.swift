@@ -14,13 +14,18 @@ final class NativeProfileSetupCoordinator: NSObject, UIAdaptivePresentationContr
   private var transitionCover: UIView?
   private var transitionAvatar: UIView?
   private var disabledSheetPans: [UIGestureRecognizer] = []
+  private var previousInteractivePopEnabled: Bool?
   private var previousDetent: UISheetPresentationController.Detent.Identifier?
   private var editorAvatarRect: CGRect?
   private var avatarDraft: [String: Any]?
+  private let startEditorEngine: (FlutterEngine) -> Bool
   private let configureEditorEngine: (FlutterEngine) -> Void
 
 
-  init(messenger: FlutterBinaryMessenger, configureEditorEngine: @escaping (FlutterEngine) -> Void) {
+  init(messenger: FlutterBinaryMessenger, startEditorEngine: @escaping (FlutterEngine) -> Bool = {
+         $0.run(withEntrypoint: "profileAvatarEditorMain", libraryURI: "package:buzz/features/profile/profile_avatar_sheet_app.dart")
+       }, configureEditorEngine: @escaping (FlutterEngine) -> Void) {
+    self.startEditorEngine = startEditorEngine
     self.configureEditorEngine = configureEditorEngine
     channel = FlutterMethodChannel(name: "buzz/profile_setup", binaryMessenger: messenger)
     super.init()
@@ -64,6 +69,7 @@ final class NativeProfileSetupCoordinator: NSObject, UIAdaptivePresentationContr
   }
   private func openAvatar(from controller: NativeProfileSetupController, args: [String: Any], session: Int) {
     guard self.session == session, avatarEngine == nil, let navigation else { return }
+    previousInteractivePopEnabled = navigation.interactivePopGestureRecognizer?.isEnabled
     previousDetent = navigation.sheetPresentationController?.selectedDetentIdentifier
     let sourceAvatar = controller.avatarSnapshot(in: navigation.view)
     controller.setAvatarHidden(true)
@@ -85,8 +91,8 @@ final class NativeProfileSetupCoordinator: NSObject, UIAdaptivePresentationContr
     }
     let engine = FlutterEngine(name: "profile-avatar-\(session)", project: nil, allowHeadlessExecution: false)
     avatarEngine = engine
-    guard engine.run(withEntrypoint: "profileAvatarEditorMain", libraryURI: "package:buzz/features/profile/profile_avatar_sheet_app.dart") else {
-      avatarEngine = nil; avatarChannel = nil; navigation.isModalInPresentation = false; controller.avatarReady(); return
+    guard startEditorEngine(engine) else {
+      restoreProfileSheet(controller); return
     }
     let editorChannel = FlutterMethodChannel(name: "buzz/profile_avatar_sheet", binaryMessenger: engine.binaryMessenger)
     avatarChannel = editorChannel
@@ -138,20 +144,14 @@ final class NativeProfileSetupCoordinator: NSObject, UIAdaptivePresentationContr
         }
         // Start the sheet resize alongside the shared-avatar return.
         navigation.sheetPresentationController?.animateChanges {
-          navigation.sheetPresentationController?.detents = [.custom(identifier: .init("profile")) { _ in 430 }, .large()]
-          navigation.sheetPresentationController?.selectedDetentIdentifier = self.previousDetent ?? .init("profile")
+          self.restoreProfileDetents()
         }
         self.animateAvatarMotion(returning: true) {
           self.transitionCover?.alpha = 0
           self.transitionAvatar?.frame = destination
         } completion: { [weak self, weak controller] in
           guard let self, self.session == session else { return }
-          controller?.setAvatarHidden(false)
-          self.clearTransition()
-          self.avatarChannel?.setMethodCallHandler(nil); self.avatarChannel = nil
-          self.avatarEngine?.destroyContext(); self.avatarEngine = nil; self.avatarController = nil; self.editorAvatarRect = nil
-          navigation.isModalInPresentation = false; controller?.avatarReady()
-          self.disabledSheetPans.forEach { $0.isEnabled = true }; self.disabledSheetPans.removeAll()
+          self.restoreProfileSheet(controller)
         }
         result(nil)
       }
@@ -196,6 +196,27 @@ final class NativeProfileSetupCoordinator: NSObject, UIAdaptivePresentationContr
     animator.addAnimations(animations)
     animator.addCompletion { _ in completion() }
     animator.startAnimation()
+  }
+
+  private func restoreProfileDetents() {
+    navigation?.sheetPresentationController?.detents = [.custom(identifier: .init("profile")) { _ in 430 }, .large()]
+    navigation?.sheetPresentationController?.selectedDetentIdentifier = previousDetent ?? .init("profile")
+  }
+
+  /// Both failed startup and normal editor return must leave a retryable sheet.
+  private func restoreProfileSheet(_ controller: NativeProfileSetupController?) {
+    restoreProfileDetents()
+    previousDetent = nil
+    clearTransition()
+    avatarChannel?.setMethodCallHandler(nil); avatarChannel = nil
+    avatarEngine?.destroyContext(); avatarEngine = nil
+    avatarController = nil; editorAvatarRect = nil
+    navigation?.isModalInPresentation = false
+    if let enabled = previousInteractivePopEnabled { navigation?.interactivePopGestureRecognizer?.isEnabled = enabled }
+    previousInteractivePopEnabled = nil
+    disabledSheetPans.forEach { $0.isEnabled = true }; disabledSheetPans.removeAll()
+    controller?.setAvatarHidden(false)
+    controller?.avatarReady()
   }
 
   private func clearTransition() {
