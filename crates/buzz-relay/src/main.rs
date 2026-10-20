@@ -1152,9 +1152,12 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     }
     step.finish();
 
-    // Make rosters follow the `member`/`bot` rows: migration 0068 changed
-    // rows without republishing, and a relay can stop between recording an
-    // agent owner and republishing that agent's rosters.
+    // Make the `member`/`bot` rows follow agent ownership, then make rosters
+    // follow the rows. A relay that predates migration 0068 can write wrong
+    // rows during a rolling deployment, so restart once after every old relay
+    // has stopped. Migration 0068 changed rows without republishing, and a
+    // relay can stop between recording an agent owner and republishing that
+    // agent's rosters.
     let mut step = StepTimer::start(StartupStep::RoleRosterReconcile);
     match buzz_relay::handlers::side_effects::reconcile_ordinary_role_rosters(&state).await {
         Ok(summary) => {

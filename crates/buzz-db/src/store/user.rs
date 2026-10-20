@@ -373,6 +373,10 @@ pub(crate) async fn set_agent_owner_with_operation(
     operation: crate::observability::WriterOperation,
 ) -> Result<AgentOwnerRecord> {
     let mut tx = crate::begin_community_write_transaction(pool, community_id, operation).await?;
+    // Serialize with `channel_members::ordinary_member_role_tx`, which every
+    // writer of an ordinary role uses: a concurrent add either sees this
+    // owner, or commits first and has its `member` row converted below.
+    crate::channel_members::acquire_agent_owner_lock(tx.conn(), community_id, agent_pubkey).await?;
     // Conditional UPDATE: only set owner if currently NULL. This makes
     // "first mint wins" atomic — no TOCTOU race between concurrent mints.
     let result = sqlx::query(
@@ -402,12 +406,11 @@ pub(crate) async fn set_agent_owner_with_operation(
         return Ok(AgentOwnerRecord::default());
     }
     // The key is now an owned agent, so its ordinary role is `bot`. The
-    // UPDATE above holds the users row lock, which
-    // `channel_members::ordinary_member_role_tx` waits on, so no concurrent
-    // add can store `member` for this key after this conversion.
+    // agent-owner lock taken above means no concurrent add can store
+    // `member` for this key after this conversion.
     //
     // This deliberately does not take the channels' membership locks: taking
-    // them after the users row lock would invert `add_member`'s lock order. A
+    // them after the agent-owner lock would invert `add_member`'s lock order. A
     // roster publish that read `member` just before this commit is refused by
     // the migration 0032 roster fence; the caller's republish of
     // `converted_channels` then writes the correct roster.

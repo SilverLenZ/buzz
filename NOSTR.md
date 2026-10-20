@@ -114,8 +114,14 @@ relay to specific external Nostr identities without granting full access.
   `member` rows to `bot` and republishes the affected kind:39002 rosters.
 - `owner`, `admin` and `guest` are stored as asked.
 
-Clients should send `member` for an ordinary member and treat a `bot` role as
-"member, owned agent".
+Clients follow three rules:
+
+- **Write:** send `member` for an ordinary member. The relay accepts `bot`
+  from older clients and stores the same role it would store for `member`.
+- **Parse:** read a `bot` role in a kind:39002 roster or kind:9000 as `member`
+  as soon as it is parsed. Do not keep `bot` as a separate client role.
+- **Identity:** never infer that a key is an agent from its channel role. A
+  key is an agent only when a verified NIP-OA attestation says so.
 
 ### Announce channels
 
