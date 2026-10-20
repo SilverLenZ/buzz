@@ -6,6 +6,21 @@
 -- apply caller must run this idempotent script so fresh bootstraps converge on
 -- the same live database contract as migration-managed databases.
 
+-- pgschema does not apply the operator-global registry seed.
+INSERT INTO _operator_global_tables (table_name, reason)
+VALUES ('entity_deletion_requests', 'Operator-global synthetic user-deletion intake')
+ON CONFLICT (table_name) DO NOTHING;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM _operator_global_tables
+        WHERE table_name = 'entity_deletion_requests'
+    ) THEN
+        RAISE EXCEPTION 'entity_deletion_requests must be operator-global after pgschema apply';
+    END IF;
+END $$;
+
 DO $$
 BEGIN
     IF NOT EXISTS (

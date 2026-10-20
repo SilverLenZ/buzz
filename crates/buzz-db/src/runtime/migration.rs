@@ -483,6 +483,7 @@ mod postgres_tests {
             "product_feedback",
             "replica_heartbeat",
             "community_deletion_requests",
+            "entity_deletion_requests",
             "community_deletion_approvals",
             "community_deletion_checkpoints",
             "community_deletion_manifest_keys",
@@ -709,7 +710,12 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 67);
+        assert_eq!(migrations.len(), 68);
+        assert_eq!(migrations[67].version, 68);
+        assert!(migrations[67]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE entity_deletion_requests"));
         assert_eq!(migrations[64].version, 65);
         let retire_ttl = strip_sql_comments(migrations[64].sql.as_str());
         for statement in [
