@@ -409,11 +409,17 @@ pub(crate) async fn set_agent_owner_with_operation(
     // agent-owner lock taken above means no concurrent add can store
     // `member` for this key after this conversion.
     //
-    // This deliberately does not take the channels' membership locks: taking
-    // them after the agent-owner lock would invert `add_member`'s lock order. A
-    // roster publish that read `member` just before this commit is refused by
-    // the migration 0032 roster fence; the caller's republish of
-    // `converted_channels` then writes the correct roster.
+    // This deliberately does not take the channels' membership locks, unlike
+    // the design's first draft: taking them after the agent-owner lock would
+    // invert `add_member`'s lock order. Rosters still converge:
+    // - a publish that captured `member` before this commit is refused by
+    //   the migration 0032 roster fence when it inserts;
+    // - a publish that inserted before this commit leaves a stale roster,
+    //   which the caller's republish of `converted_channels` replaces (it
+    //   takes the membership lock, so it waits for that publish);
+    // - if the relay stops before the republish, the startup scan
+    //   (`list_channel_rosters_with_stale_ordinary_roles`) finds the roster.
+    // `owner_record_during_roster_publication_converges` covers both orders.
     let converted_channels: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE channel_members SET role = 'bot' \
          WHERE community_id = $1 AND pubkey = $2 AND role = 'member' AND removed_at IS NULL \

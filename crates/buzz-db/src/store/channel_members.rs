@@ -2886,6 +2886,209 @@ mod postgres_tests {
         assert_eq!(second, crate::user::AgentOwnerRecord::default());
     }
 
+    /// Any writing member may make a guest a member, and the relay still
+    /// stores an owned agent's ordinary role as `bot` when the actor is not
+    /// the agent's owner.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn non_owner_member_raising_a_guest_agent_stores_bot() {
+        let pool = setup_pool().await;
+        let community_id = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_id);
+        let creator = random_pubkey();
+        let owner = random_pubkey();
+        let agent = random_pubkey();
+        let peer = random_pubkey();
+        for key in [&creator, &owner, &agent, &peer] {
+            ensure_user(&pool, community, key)
+                .await
+                .expect("ensure user");
+        }
+        set_agent_owner(&pool, community, &agent, &owner)
+            .await
+            .expect("record agent owner");
+        let channel = open_test_channel(&pool, community_id, &creator).await;
+        add_member(&pool, community, channel, &peer, MemberRole::Member, None)
+            .await
+            .expect("add peer");
+        add_member(&pool, community, channel, &agent, MemberRole::Guest, None)
+            .await
+            .expect("add agent as guest");
+
+        add_member(
+            &pool,
+            community,
+            channel,
+            &agent,
+            MemberRole::Member,
+            Some(&peer),
+        )
+        .await
+        .expect("a member who is not the owner raises the guest agent");
+        assert_eq!(
+            stored_role(&pool, community_id, channel, &agent).await,
+            "bot"
+        );
+    }
+
+    /// The roster a relay would build from `snapshot`, at `created_at`.
+    /// The relay gives each roster a later second than the last one
+    /// (`emit_addressable_discovery_event`), so the replaceable tie-break never
+    /// drops a republish; callers pass increasing times to match.
+    fn snapshot_roster(
+        snapshot: &LockedMemberSnapshot,
+        relay_keys: &Keys,
+        created_at: u64,
+    ) -> nostr::Event {
+        let tags = std::iter::once(
+            nostr::Tag::parse(["d", &snapshot.channel_id().to_string()]).expect("d tag"),
+        )
+        .chain(snapshot.members.iter().map(|m| {
+            nostr::Tag::parse(["p", &hex::encode(&m.pubkey), "", &m.role]).expect("p tag")
+        }))
+        .collect::<Vec<_>>();
+        nostr::EventBuilder::new(nostr::Kind::Custom(39002), "")
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(relay_keys)
+            .expect("sign roster")
+    }
+
+    /// Publish the roster built from `snapshot` and commit.
+    async fn publish_snapshot(
+        mut snapshot: LockedMemberSnapshot,
+        relay_keys: &Keys,
+        created_at: u64,
+    ) -> Result<()> {
+        let event = snapshot_roster(&snapshot, relay_keys, created_at);
+        snapshot.replace_member_event(&event).await?;
+        snapshot.release().await
+    }
+
+    /// Recording an agent owner does not take the channels' membership locks
+    /// (see `set_agent_owner_with_operation`). The roster still converges in
+    /// both orders around a concurrent roster publication:
+    ///
+    /// - the record commits between capture and replacement: the roster
+    ///   fence refuses the stale roster, and the republish writes `bot`;
+    /// - the stale roster commits first: the startup scan reports it, and the
+    ///   republish writes `bot`.
+    ///
+    /// Each record must also finish while the publisher holds the membership
+    /// lock: it must not wait on it.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn owner_record_during_roster_publication_converges() {
+        let pool = setup_pool().await;
+        let community_id = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_id);
+        let relay_keys = Keys::generate();
+        let relay_pubkey = relay_keys.public_key().to_bytes();
+        let snapshot_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect(&crate::test_support::database_url())
+            .await
+            .expect("connect one-connection pool");
+
+        for record_before_replace in [true, false] {
+            let stale_at = nostr::Timestamp::now().as_secs();
+            let creator = random_pubkey();
+            let owner = random_pubkey();
+            let agent = random_pubkey();
+            for key in [&creator, &owner, &agent] {
+                ensure_user(&pool, community, key)
+                    .await
+                    .expect("ensure user");
+            }
+            let channel = open_test_channel(&pool, community_id, &creator).await;
+            add_member(&pool, community, channel, &agent, MemberRole::Member, None)
+                .await
+                .expect("add unowned agent");
+
+            let snapshot = lock_member_snapshot(&snapshot_pool, community, channel, &relay_pubkey)
+                .await
+                .expect("capture roster");
+            assert!(snapshot
+                .members
+                .iter()
+                .any(|m| m.pubkey == agent && m.role == "member"));
+            let record_owner = || async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    crate::user::set_agent_owner_with_operation(
+                        &pool,
+                        community,
+                        &agent,
+                        &owner,
+                        crate::observability::WriterOperation::EventWrite,
+                    ),
+                )
+                .await
+                .expect("owner record must not wait on the membership lock")
+                .expect("record owner")
+            };
+
+            let record = if record_before_replace {
+                let record = record_owner().await;
+                let refused = publish_snapshot(snapshot, &relay_keys, stale_at).await;
+                assert!(
+                    refused.is_err(),
+                    "the roster fence must refuse a roster captured before the record"
+                );
+                record
+            } else {
+                let mut snapshot = snapshot;
+                let event = snapshot_roster(&snapshot, &relay_keys, stale_at);
+                snapshot
+                    .replace_member_event(&event)
+                    .await
+                    .expect("replace before the record commits");
+                let record = record_owner().await;
+                snapshot.release().await.expect("commit stale roster");
+                let stale = list_channel_rosters_with_stale_ordinary_roles(&pool, &relay_pubkey)
+                    .await
+                    .expect("list stale rosters");
+                assert!(
+                    stale.iter().any(|c| c.channel_id == channel),
+                    "the startup scan must report the stale roster"
+                );
+                record
+            };
+            assert_eq!(record.converted_channels, vec![channel]);
+
+            // The caller's republish of `converted_channels`.
+            let snapshot = lock_member_snapshot(&snapshot_pool, community, channel, &relay_pubkey)
+                .await
+                .expect("capture roster for republish");
+            publish_snapshot(snapshot, &relay_keys, stale_at + 1)
+                .await
+                .expect("republish converted roster");
+            let live: serde_json::Value = sqlx::query_scalar(
+                "SELECT tags FROM events WHERE community_id = $1 AND channel_id = $2 \
+                 AND kind = 39002 AND deleted_at IS NULL",
+            )
+            .bind(community_id)
+            .bind(channel)
+            .fetch_one(&pool)
+            .await
+            .expect("read live roster");
+            assert!(
+                live.as_array().expect("tags").iter().any(|tag| {
+                    tag[0] == "p" && tag[1] == hex::encode(&agent) && tag[3] == "bot"
+                }),
+                "live roster must name the agent bot: {live}"
+            );
+            assert!(
+                !list_channel_rosters_with_stale_ordinary_roles(&pool, &relay_pubkey)
+                    .await
+                    .expect("list stale rosters")
+                    .iter()
+                    .any(|c| c.channel_id == channel)
+            );
+        }
+    }
+
     /// Insert a relay-authored kind:39002 roster that matches the current
     /// rows, as migration 0032's fence requires.
     async fn publish_matching_roster(
