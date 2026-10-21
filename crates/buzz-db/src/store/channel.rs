@@ -28,10 +28,9 @@ pub use crate::channel_members::{
     get_member_count, get_member_counts_bulk, get_member_role, get_members, get_members_bulk,
     get_users_bulk, is_member, list_channel_rosters_with_stale_ordinary_roles,
     list_large_channel_rosters_needing_reconciliation, lock_member_snapshot, membership_pairs,
-    normalize_ordinary_member_roles, remove_member, verify_channel_roster_fence_behavior,
-    verify_channel_roster_fence_catalog, AccessibleChannel, BotChannelEntry, BotMemberRecord,
-    ChannelIdentity, LargeChannelRoster, LockedMemberSnapshot, MemberRecord,
-    OrdinaryRoleNormalization, StaleRoleRoster, UserRecord,
+    remove_member, verify_channel_roster_fence_behavior, verify_channel_roster_fence_catalog,
+    AccessibleChannel, BotChannelEntry, BotMemberRecord, ChannelIdentity, LargeChannelRoster,
+    LockedMemberSnapshot, MemberRecord, StaleRoleRoster, UserRecord,
 };
 
 /// A channel row as returned from the database.

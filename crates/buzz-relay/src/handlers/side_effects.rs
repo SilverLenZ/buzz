@@ -3500,28 +3500,15 @@ pub async fn reconcile_large_channel_member_snapshots(
     Ok(summary)
 }
 
-/// Make the `member`/`bot` rows follow agent ownership, then republish
-/// rosters that still disagree with the rows.
+/// Republish rosters whose `member`/`bot` roles disagree with the rows: after
+/// the maintenance script `scripts/maintenance/bot_role_follows_agent_owner.sql`
+/// changed rows without republishing, or after a relay stopped between
+/// recording an agent owner and republishing that agent's rosters.
 ///
-/// The rows can be wrong after a rolling deployment: a relay that predates
-/// migration 0068 can still write an owned agent as `member`, or an unowned
-/// key as `bot`. A roster can be stale after migration 0068 or the row repair
-/// changed rows, or after a relay stopped between recording an agent owner
-/// and republishing that agent's rosters.
-///
-/// Converged deployments find no candidates, so this only reads. A row that
-/// could not be repaired counts as a failure; the next startup retries it.
+/// Converged deployments find no candidates, so this only reads.
 pub async fn reconcile_ordinary_role_rosters(
     state: &Arc<AppState>,
 ) -> anyhow::Result<ReconcileSummary> {
-    let normalized = state.db.normalize_ordinary_member_roles().await?;
-    if normalized.rows > 0 || normalized.failed_keys > 0 {
-        info!(
-            rows = normalized.rows,
-            failed_keys = normalized.failed_keys,
-            "member/bot rows normalized to agent ownership"
-        );
-    }
     let relay_pubkey = state.relay_keypair.public_key();
     let candidates = state
         .db
@@ -3538,10 +3525,7 @@ pub async fn reconcile_ordinary_role_rosters(
     .await;
     metrics::counter!("buzz_channel_role_roster_reconciliations_total")
         .increment(summary.repaired as u64);
-    Ok(ReconcileSummary {
-        repaired: summary.repaired,
-        failed: summary.failed + normalized.failed_keys,
-    })
+    Ok(summary)
 }
 
 /// Republish each `(community, host, channel)` roster under its membership

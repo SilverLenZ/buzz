@@ -1576,7 +1576,8 @@ pub struct StaleRoleRoster {
 /// Returns active channels whose live roster disagrees with the stored rows
 /// about `member` versus `bot`.
 ///
-/// Such a roster exists after migration 0068 changed the rows, or when a
+/// Such a roster exists after the bot-role maintenance script changed the
+/// rows, or when a
 /// relay stopped between recording an agent owner and republishing the
 /// rosters. Only two kinds of channel can disagree, so only they are read:
 /// channels with an active `bot` row, and channels whose roster names someone
@@ -1660,131 +1661,6 @@ pub async fn list_channel_rosters_with_stale_ordinary_roles(
             })
         })
         .collect()
-}
-
-/// Keys read per page by [`normalize_ordinary_member_roles`].
-const ORDINARY_ROLE_NORMALIZE_PAGE: i64 = 500;
-
-/// The result of [`normalize_ordinary_member_roles`].
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct OrdinaryRoleNormalization {
-    /// Active membership rows changed between `member` and `bot`.
-    pub rows: u64,
-    /// Keys whose rows could not be changed. A later run retries them.
-    pub failed_keys: usize,
-}
-
-/// Make every active `member`/`bot` row follow the key's agent owner: `bot`
-/// when `users.agent_owner_pubkey` is set, otherwise `member`.
-///
-/// Migration 0068 does this once. During a rolling deployment a relay that
-/// predates it can still write an owned agent as `member`, or an unowned key
-/// as `bot`, after the migration ran. This pass repairs those rows once the
-/// old relays are gone; the relay runs it at startup before
-/// [`list_channel_rosters_with_stale_ordinary_roles`], which then finds the
-/// changed rosters.
-///
-/// Each key is changed in its own transaction under its agent-owner lock, so
-/// the pass cannot undo a concurrent first owner record. Keys are read in
-/// pages after a keyset cursor, so a key that keeps failing does not stop the
-/// pass. Rerunning it is safe; a converged database only reads. Only active
-/// communities are scanned, as in migration 0068.
-pub async fn normalize_ordinary_member_roles(pool: &PgPool) -> Result<OrdinaryRoleNormalization> {
-    normalize_ordinary_member_roles_in(pool, None).await
-}
-
-/// [`normalize_ordinary_member_roles`], limited to one community when
-/// `community` is set. Tests use the limit to stay out of each other's rows.
-async fn normalize_ordinary_member_roles_in(
-    pool: &PgPool,
-    community: Option<Uuid>,
-) -> Result<OrdinaryRoleNormalization> {
-    let mut summary = OrdinaryRoleNormalization::default();
-    let mut cursor: Option<(Uuid, Vec<u8>)> = None;
-    loop {
-        let page: Vec<(Uuid, Vec<u8>)> = {
-            let mut connection = crate::observability::acquire_writer(
-                pool,
-                crate::observability::WriterOperation::Maintenance,
-            )
-            .await?;
-            sqlx::query_as(
-                r#"
-                SELECT DISTINCT cm.community_id, cm.pubkey
-                FROM channel_members cm
-                JOIN communities c
-                  ON c.id = cm.community_id
-                 AND c.deletion_state = 'active'
-                LEFT JOIN users u
-                  ON u.community_id = cm.community_id
-                 AND u.pubkey = cm.pubkey
-                WHERE cm.removed_at IS NULL
-                  AND cm.role IN ('member', 'bot')
-                  AND cm.role <> CASE WHEN u.agent_owner_pubkey IS NOT NULL
-                                      THEN 'bot'::member_role
-                                      ELSE 'member'::member_role END
-                  AND ($1::uuid IS NULL OR (cm.community_id, cm.pubkey) > ($1, $2))
-                  AND ($4::uuid IS NULL OR cm.community_id = $4)
-                ORDER BY cm.community_id, cm.pubkey
-                LIMIT $3
-                "#,
-            )
-            .bind(cursor.as_ref().map(|(community, _)| *community))
-            .bind(cursor.as_ref().map(|(_, pubkey)| pubkey.clone()))
-            .bind(ORDINARY_ROLE_NORMALIZE_PAGE)
-            .bind(community)
-            .fetch_all(&mut *connection)
-            .await?
-        };
-        let Some(last) = page.last().cloned() else {
-            return Ok(summary);
-        };
-        for (page_community, pubkey) in page {
-            let community_id = CommunityId::from_uuid(page_community);
-            match normalize_key_ordinary_roles(pool, community_id, &pubkey).await {
-                Ok(rows) => summary.rows += rows,
-                Err(error) => {
-                    summary.failed_keys += 1;
-                    tracing::warn!(
-                        %community_id,
-                        pubkey = %hex::encode(&pubkey),
-                        %error,
-                        "member/bot row normalization failed"
-                    );
-                }
-            }
-        }
-        cursor = Some(last);
-    }
-}
-
-/// Change one key's active `member`/`bot` rows to its ordinary role, under
-/// the key's agent-owner lock.
-async fn normalize_key_ordinary_roles(
-    pool: &PgPool,
-    community_id: CommunityId,
-    pubkey: &[u8],
-) -> Result<u64> {
-    let mut tx = crate::begin_community_write_transaction(
-        pool,
-        community_id,
-        crate::observability::WriterOperation::Maintenance,
-    )
-    .await?;
-    let role = ordinary_member_role_tx(tx.conn(), community_id, pubkey).await?;
-    let changed = sqlx::query(
-        "UPDATE channel_members SET role = $3::member_role \
-         WHERE community_id = $1 AND pubkey = $2 AND removed_at IS NULL \
-           AND role IN ('member', 'bot') AND role <> $3::member_role",
-    )
-    .bind(community_id.as_uuid())
-    .bind(pubkey)
-    .bind(role.as_str())
-    .execute(tx.conn())
-    .await?
-    .rows_affected();
-    tx.commit().await?;
-    Ok(changed)
 }
 
 /// Transaction-aware variant of [`get_active_role_tx`].
@@ -2411,12 +2287,6 @@ impl Db {
         relay_pubkey: &[u8],
     ) -> Result<Vec<StaleRoleRoster>> {
         list_channel_rosters_with_stale_ordinary_roles(&self.pool, relay_pubkey).await
-    }
-
-    /// Make every active `member`/`bot` row follow the key's agent owner.
-    #[datastore_span(name = "normalize_ordinary_member_roles", system = "postgresql")]
-    pub async fn normalize_ordinary_member_roles(&self) -> Result<OrdinaryRoleNormalization> {
-        normalize_ordinary_member_roles(&self.pool).await
     }
 
     /// Returns full channel records for all channels a user can access.
@@ -3220,92 +3090,6 @@ mod postgres_tests {
         );
     }
 
-    /// Migration 0068's backfill applies the write rule to existing rows and
-    /// skips non-active communities instead of aborting on their write fence.
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn bot_role_backfill_follows_agent_owner_and_skips_fenced_communities() {
-        let pool = setup_pool().await;
-        let creator = random_pubkey();
-        let owner = random_pubkey();
-        let agent = random_pubkey();
-        let person = random_pubkey();
-        let leaver = random_pubkey();
-
-        let active_id = make_test_community(&pool).await;
-        let fenced_id = make_test_community(&pool).await;
-        let mut channels = Vec::new();
-        for community_id in [active_id, fenced_id] {
-            let community = CommunityId::from_uuid(community_id);
-            for key in [&creator, &owner, &agent, &person, &leaver] {
-                ensure_user(&pool, community, key)
-                    .await
-                    .expect("ensure user");
-            }
-            let channel = open_test_channel(&pool, community_id, &creator).await;
-            // The pre-0068 state: an owned agent stored as `member`, and
-            // unowned keys stored as `bot`, one of them removed.
-            sqlx::query(
-                "INSERT INTO channel_members (community_id, channel_id, pubkey, role, removed_at) \
-                 VALUES ($1, $2, $3, 'member', NULL), ($1, $2, $4, 'bot', NULL), \
-                        ($1, $2, $5, 'bot', NOW())",
-            )
-            .bind(community_id)
-            .bind(channel)
-            .bind(&agent)
-            .bind(&person)
-            .bind(&leaver)
-            .execute(&pool)
-            .await
-            .expect("seed pre-0068 rows");
-            sqlx::query(
-                "UPDATE users SET agent_owner_pubkey = $3 WHERE community_id = $1 AND pubkey = $2",
-            )
-            .bind(community_id)
-            .bind(&agent)
-            .bind(&owner)
-            .execute(&pool)
-            .await
-            .expect("record owner without conversion");
-            channels.push(channel);
-        }
-        crate::test_support::set_deletion_state(&pool, fenced_id, "fenced").await;
-
-        let backfill = include_str!("../../../../migrations/0068_bot_role_follows_agent_owner.sql");
-        let mut tx = pool.begin().await.expect("begin");
-        sqlx::raw_sql(backfill)
-            .execute(&mut *tx)
-            .await
-            .expect("backfill must not hit the community write fence");
-        tx.commit().await.expect("commit backfill");
-
-        let (active_channel, fenced_channel) = (channels[0], channels[1]);
-        assert_eq!(
-            stored_role(&pool, active_id, active_channel, &agent).await,
-            "bot"
-        );
-        assert_eq!(
-            stored_role(&pool, active_id, active_channel, &person).await,
-            "member"
-        );
-        assert_eq!(
-            stored_role(&pool, active_id, active_channel, &leaver).await,
-            "bot"
-        );
-        assert_eq!(
-            stored_role(&pool, active_id, active_channel, &creator).await,
-            "owner"
-        );
-        assert_eq!(
-            stored_role(&pool, fenced_id, fenced_channel, &agent).await,
-            "member"
-        );
-        assert_eq!(
-            stored_role(&pool, fenced_id, fenced_channel, &person).await,
-            "bot"
-        );
-    }
-
     /// First authentication can create a key's user row and record its owner
     /// while an add of that key is open: the add read no user row and chose
     /// `member`. The owner record must wait for the add and then convert the
@@ -3380,15 +3164,17 @@ mod postgres_tests {
         );
     }
 
-    /// After migration 0068, a relay that predates it can still store an owned
-    /// agent as `member` and an unowned key as `bot`, and publish a roster
-    /// that matches. The roster reconcile alone sees nothing to do. The row
-    /// normalization repairs the rows, after which the reconcile finds the
-    /// roster. Removed rows, other roles and non-active communities are left
-    /// alone, and a second pass changes nothing.
+    /// Rows written before the write rule (or by an older relay during a
+    /// rolling deploy) can store an owned agent as `member` and an unowned key
+    /// as `bot`, with a roster that matches. The roster reconcile alone sees
+    /// nothing to do. The maintenance script
+    /// `scripts/maintenance/bot_role_follows_agent_owner.sql` repairs the
+    /// rows, after which the reconcile finds the roster. Removed rows, other
+    /// roles and non-active communities are left alone, the validation
+    /// queries return 0, and a second run changes nothing.
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn row_normalization_repairs_old_relay_writes_after_migration() {
+    async fn bot_role_maintenance_script_repairs_rows_and_skips_fenced_communities() {
         let pool = setup_pool().await;
         let relay_pubkey = random_pubkey();
         let creator = random_pubkey();
@@ -3407,8 +3193,8 @@ mod postgres_tests {
                     .await
                     .expect("ensure user");
             }
-            // The owner was recorded before this relay's writes: migration
-            // 0068 had nothing of the agent's to convert.
+            // The owner was recorded before these writes, so nothing
+            // converted them.
             crate::user::set_agent_owner(&pool, community, &agent, &owner)
                 .await
                 .expect("record owner");
@@ -3447,20 +3233,7 @@ mod postgres_tests {
             "a roster that matches wrong rows looks converged"
         );
 
-        for community_id in [active_id, fenced_id] {
-            let normalized = normalize_ordinary_member_roles_in(&pool, Some(community_id))
-                .await
-                .expect("normalize rows");
-            let expected_rows = if community_id == active_id { 2 } else { 0 };
-            assert_eq!(
-                normalized,
-                OrdinaryRoleNormalization {
-                    rows: expected_rows,
-                    failed_keys: 0,
-                },
-                "a non-active community is not scanned"
-            );
-        }
+        run_bot_role_maintenance_script(&pool).await;
         assert_eq!(
             stored_role(&pool, active_id, active_channel, &agent).await,
             "bot"
@@ -3489,12 +3262,71 @@ mod postgres_tests {
         );
 
         assert_eq!(
-            normalize_ordinary_member_roles_in(&pool, Some(active_id))
-                .await
-                .expect("second pass"),
-            OrdinaryRoleNormalization::default(),
-            "a converged community only reads"
+            bot_role_validation_counts(&pool, active_id).await,
+            [0, 0],
+            "validation queries"
         );
+        let before = stored_roles(&pool, active_id).await;
+        run_bot_role_maintenance_script(&pool).await;
+        assert_eq!(
+            stored_roles(&pool, active_id).await,
+            before,
+            "a second run changes nothing"
+        );
+    }
+
+    const BOT_ROLE_SCRIPT: &str =
+        include_str!("../../../../scripts/maintenance/bot_role_follows_agent_owner.sql");
+
+    /// Run the script's repair block the way psql does: alone, outside any
+    /// transaction, so its per-key COMMIT is allowed.
+    async fn run_bot_role_maintenance_script(pool: &PgPool) {
+        let start = BOT_ROLE_SCRIPT.find("DO $$").expect("DO block");
+        let end = BOT_ROLE_SCRIPT[start..]
+            .find("\n$$;")
+            .expect("DO block end")
+            + start
+            + 4;
+        sqlx::raw_sql(&BOT_ROLE_SCRIPT[start..end])
+            .execute(pool)
+            .await
+            .expect("maintenance script");
+    }
+
+    /// The script's two validation queries, limited to one community so
+    /// parallel tests stay out of each other's rows.
+    async fn bot_role_validation_counts(pool: &PgPool, community_id: Uuid) -> Vec<i64> {
+        let queries: Vec<&str> = BOT_ROLE_SCRIPT
+            .split("\\echo 'Validation")
+            .skip(1)
+            .map(|q| {
+                let q = &q[q.find('\n').expect("query line") + 1..];
+                q.trim().trim_end_matches(';')
+            })
+            .collect();
+        assert_eq!(queries.len(), 2, "two validation queries");
+        let mut counts = Vec::new();
+        for query in queries {
+            let scoped = format!("{query} AND cm.community_id = $1");
+            let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(scoped))
+                .bind(community_id)
+                .fetch_one(pool)
+                .await
+                .expect("validation query");
+            counts.push(n);
+        }
+        counts
+    }
+
+    async fn stored_roles(pool: &PgPool, community_id: Uuid) -> Vec<(Vec<u8>, String)> {
+        sqlx::query_as(
+            "SELECT pubkey, role::text FROM channel_members \
+             WHERE community_id = $1 AND removed_at IS NULL ORDER BY channel_id, pubkey",
+        )
+        .bind(community_id)
+        .fetch_all(pool)
+        .await
+        .expect("stored roles")
     }
 
     #[tokio::test]

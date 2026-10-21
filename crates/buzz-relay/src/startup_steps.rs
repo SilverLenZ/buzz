@@ -69,8 +69,7 @@ pub enum StartupStep {
     ChannelRosterFence,
     /// Repair large NIP-29 channel roster snapshots.
     LargeRosterReconcile,
-    /// Normalize `member`/`bot` rows to agent ownership, then republish
-    /// rosters that disagree with the rows.
+    /// Republish rosters whose `member`/`bot` roles disagree with the rows.
     RoleRosterReconcile,
     /// Bind the private health listener.
     HealthBind,
