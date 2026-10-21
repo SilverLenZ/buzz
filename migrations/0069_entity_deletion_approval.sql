@@ -8,10 +8,7 @@ ALTER TABLE entity_deletion_requests
     ADD CONSTRAINT entity_deletion_requests_status_check
         CHECK (status IN ('submitted', 'inventoried', 'approved')) NOT VALID,
     ADD COLUMN inventory_manifest JSONB,
-    ADD COLUMN inventory_digest TEXT,
-    ADD COLUMN approved_by TEXT,
-    ADD COLUMN approved_at TIMESTAMPTZ,
-    ADD COLUMN approved_inventory_digest TEXT;
+    ADD COLUMN inventory_digest TEXT;
 -- Validate in 0070 so the scan does not retain this transaction's DDL lock.
 
 -- Operator-global workflow history. Retained after community deletion as
@@ -37,4 +34,19 @@ CREATE INDEX entity_deletion_stage_history_request_idx
 
 INSERT INTO _operator_global_tables (table_name, reason)
 VALUES ('entity_deletion_stage_history', 'Operator-global deletion workflow history retained for recovery and audit')
+ON CONFLICT (table_name) DO NOTHING;
+
+-- Approval evidence is retained after community deletion for operator audit.
+-- Each operator approves an inventory once; retries preserve the original row.
+CREATE TABLE entity_deletion_approvals (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id UUID NOT NULL,
+    inventory_digest TEXT NOT NULL CHECK (inventory_digest ~ '^[0-9a-f]{64}$'),
+    approved_by TEXT NOT NULL CHECK (approved_by = btrim(approved_by) AND octet_length(approved_by) >= 1 AND octet_length(approved_by) <= 256),
+    approved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (request_id, inventory_digest, approved_by)
+);
+
+INSERT INTO _operator_global_tables (table_name, reason)
+VALUES ('entity_deletion_approvals', 'Operator-global deletion approval history retained for audit')
 ON CONFLICT (table_name) DO NOTHING;

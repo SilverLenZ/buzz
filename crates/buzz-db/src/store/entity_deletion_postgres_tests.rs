@@ -12,7 +12,8 @@ async fn assert_plain_schema(pool: &PgPool) {
     let fences: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_trigger
          WHERE tgrelid IN ('entity_deletion_requests'::regclass,
-                           'entity_deletion_stage_history'::regclass)",
+                           'entity_deletion_stage_history'::regclass,
+                           'entity_deletion_approvals'::regclass)",
     )
     .fetch_one(pool)
     .await
@@ -21,7 +22,8 @@ async fn assert_plain_schema(pool: &PgPool) {
     let foreign_keys: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_constraint
          WHERE conrelid IN ('entity_deletion_requests'::regclass,
-                            'entity_deletion_stage_history'::regclass) AND contype = 'f'",
+                            'entity_deletion_stage_history'::regclass,
+                           'entity_deletion_approvals'::regclass) AND contype = 'f'",
     )
     .fetch_one(pool)
     .await
@@ -197,6 +199,7 @@ async fn approval_is_atomic_idempotent_and_bound_to_inventory() {
     let digest = request.inventory_digest.as_deref().unwrap();
     let before = store.inspect(request.id).await.unwrap();
     assert!(before.stage_history.is_empty());
+    assert!(before.approvals.is_empty());
     let inventory = before.request.inventory_manifest.as_ref().unwrap();
     assert_eq!(inventory["communities"][0]["relationship"], "participant");
     assert_eq!(
@@ -216,9 +219,12 @@ async fn approval_is_atomic_idempotent_and_bound_to_inventory() {
     );
     let approved = a.unwrap();
     assert_eq!(approved.status, "approved");
-    assert_eq!(approved.approved_at, b.unwrap().approved_at);
-    assert_eq!(approved.approved_inventory_digest.as_deref(), Some(digest));
+    assert_eq!(approved.updated_at, b.unwrap().updated_at);
     let after = store.inspect(request.id).await.unwrap();
+    assert_eq!(after.approvals.len(), 1);
+    assert_eq!(after.approvals[0].request_id, request.id);
+    assert_eq!(after.approvals[0].approved_by, "operator-b");
+    assert_eq!(after.approvals[0].inventory_digest, digest);
     assert_eq!(after.stage_history.len(), 1);
     let stage = &after.stage_history[0];
     assert_eq!(stage.request_id, request.id);
@@ -229,10 +235,10 @@ async fn approval_is_atomic_idempotent_and_bound_to_inventory() {
     assert!(stage.started_at.is_none());
     assert!(stage.finished_at.is_none());
     assert_eq!(stage.metadata_json, serde_json::json!({}));
-    assert!(store
-        .approve(request.id, "operator-c", digest)
+    store
+        .approve(request.id, "operator-b", digest)
         .await
-        .is_err());
+        .unwrap();
     store
         .submit("demo:approval", "operator-a", None)
         .await
@@ -241,6 +247,33 @@ async fn approval_is_atomic_idempotent_and_bound_to_inventory() {
         serde_json::to_value(store.inspect(request.id).await.unwrap()).unwrap(),
         serde_json::to_value(&after).unwrap()
     );
+    // A different operator adds evidence without replacing the first approval
+    // or recreating the starting stage. Concurrent retries still add one row.
+    let (a, b) = tokio::join!(
+        store.approve(request.id, "operator-c", digest),
+        store.approve(request.id, "operator-c", digest),
+    );
+    a.unwrap();
+    b.unwrap();
+    let multiple = store.inspect(request.id).await.unwrap();
+    assert_eq!(multiple.approvals.len(), 2);
+    assert_eq!(multiple.approvals[1].approved_by, "operator-c");
+    assert_ne!(multiple.approvals[0].id, multiple.approvals[1].id);
+    assert!(multiple.approvals[1].approved_at > multiple.approvals[0].approved_at);
+    assert_eq!(
+        serde_json::to_value(&multiple.approvals[0]).unwrap(),
+        serde_json::to_value(&after.approvals[0]).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&multiple.stage_history).unwrap(),
+        serde_json::to_value(&after.stage_history).unwrap()
+    );
+    assert_eq!(multiple.request.updated_at, after.request.updated_at);
+    assert!(store
+        .approve(request.id, "operator-d", "wrong")
+        .await
+        .is_err());
+    assert_eq!(store.inspect(request.id).await.unwrap().approvals.len(), 2);
     // The invariant is enforced by the live partial unique index.
     assert!(sqlx::query(
         "INSERT INTO entity_deletion_stage_history (request_id, stage) VALUES ($1, 'drain')"
@@ -265,7 +298,7 @@ async fn approval_rolls_back_when_starting_stage_cannot_be_saved() {
         .await
         .unwrap();
     // Fault injection: a current row makes the final INSERT fail after the
-    // approval UPDATE. The production transaction must roll back that UPDATE.
+    // parent UPDATE and approval INSERT. Both must roll back.
     sqlx::query(
         "INSERT INTO entity_deletion_stage_history (request_id, stage) VALUES ($1, 'unexpected')",
     )
@@ -352,6 +385,7 @@ async fn migration_schema_approval_preserves_legacy_intake_and_resubmission_prep
     assert_eq!(before.request.status, "submitted");
     assert!(before.request.inventory_manifest.is_none());
     assert!(before.stage_history.is_empty());
+    assert!(before.approvals.is_empty());
     assert!(store.approve(id, "operator-b", "unknown").await.is_err());
     let prepared = store
         .submit("demo:legacy", "operator-a", None)
@@ -368,11 +402,47 @@ async fn migration_schema_approval_preserves_legacy_intake_and_resubmission_prep
         .await
         .unwrap();
     assert_plain_schema(&store.pool).await;
-    let registered: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM _operator_global_tables WHERE table_name = 'entity_deletion_stage_history')")
-        .fetch_one(&store.pool).await.unwrap();
-    assert!(registered);
+    let registered: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM _operator_global_tables WHERE table_name IN
+         ('entity_deletion_stage_history', 'entity_deletion_approvals')",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    assert_eq!(registered, 2);
+    let approved = store.inspect(id).await.unwrap();
+    assert_eq!(approved.approvals.len(), 1);
+    assert_eq!(approved.approvals[0].approved_by, "operator-b");
     // The previous CLI's INSERT remains valid after the upgrade.
     sqlx::query("INSERT INTO entity_deletion_requests (target, requested_by) VALUES ('demo:old-cli', 'operator-a')")
         .execute(&store.pool).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn approval_refuses_to_repair_missing_evidence() {
+    let store = store().await;
+    let request = store
+        .submit("demo:missing-evidence", "operator-a", None)
+        .await
+        .unwrap();
+    let digest = request.inventory_digest.as_deref().unwrap();
+    store
+        .approve(request.id, "operator-b", digest)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM entity_deletion_approvals WHERE request_id = $1")
+        .bind(request.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let before = store.inspect(request.id).await.unwrap();
+    assert!(store
+        .approve(request.id, "operator-c", digest)
+        .await
+        .is_err());
+    assert_eq!(
+        serde_json::to_value(store.inspect(request.id).await.unwrap()).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
 }

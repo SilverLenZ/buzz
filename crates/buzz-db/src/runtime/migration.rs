@@ -483,6 +483,7 @@ mod postgres_tests {
             "product_feedback",
             "replica_heartbeat",
             "community_deletion_requests",
+            "entity_deletion_approvals",
             "entity_deletion_requests",
             "entity_deletion_stage_history",
             "community_deletion_approvals",
@@ -2791,6 +2792,7 @@ mod postgres_tests {
             "relay_admin_actions",
             "relay_admin_outbox",
             "relay_operator_audit",
+            "entity_deletion_approvals",
             "entity_deletion_requests",
             "entity_deletion_stage_history",
         ] {
@@ -2810,7 +2812,11 @@ mod postgres_tests {
             );
         }
 
-        for table in ["entity_deletion_requests", "entity_deletion_stage_history"] {
+        for table in [
+            "entity_deletion_requests",
+            "entity_deletion_stage_history",
+            "entity_deletion_approvals",
+        ] {
             assert_eq!(
                 constraints(&desired, table).await,
                 constraints(&migrated, table).await,

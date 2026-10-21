@@ -10,8 +10,5 @@ CREATE TABLE entity_deletion_requests (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     inventory_manifest JSONB,
     inventory_digest TEXT,
-    approved_by TEXT,
-    approved_at TIMESTAMPTZ,
-    approved_inventory_digest TEXT,
     UNIQUE (entity_type, target)
 );

@@ -29,12 +29,29 @@ pub struct EntityStage {
     pub updated_at: DateTime<Utc>,
 }
 
-/// A consistent snapshot of a request, its approval, and reached stages.
+/// One retained approval of a particular request inventory.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct EntityApproval {
+    /// Stable identifier; identical approval retries retain it.
+    pub id: Uuid,
+    /// Parent request, checked and locked by the approval transaction.
+    pub request_id: Uuid,
+    /// SHA-256 of the inventory this operator approved.
+    pub inventory_digest: String,
+    /// Self-asserted demo identity, not authenticated real-deletion authorization.
+    pub approved_by: String,
+    /// Time this approval was first recorded.
+    pub approved_at: DateTime<Utc>,
+}
+
+/// A consistent snapshot of a request, its approvals, and reached stages.
 #[derive(Debug, Serialize)]
 pub struct EntityInspection {
     /// Request fields remain at the top level of CLI JSON.
     #[serde(flatten)]
     pub request: EntityRequest,
+    /// Retained approvals, ordered by approval time and identifier.
+    pub approvals: Vec<EntityApproval>,
     /// History including the current resume position, if approved.
     pub stage_history: Vec<EntityStage>,
 }
@@ -48,14 +65,21 @@ impl EntityDeletionStore {
             .await?;
         let request = sqlx::query_as(
             "SELECT id, entity_type, target, status, requested_by, reason, created_at, updated_at,
-                    inventory_manifest, inventory_digest, approved_by, approved_at,
-                    approved_inventory_digest
+                    inventory_manifest, inventory_digest
              FROM entity_deletion_requests WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| DbError::NotFound(format!("entity deletion request {id}")))?;
+        let approvals = sqlx::query_as(
+            "SELECT id, request_id, inventory_digest, approved_by, approved_at
+             FROM entity_deletion_approvals WHERE request_id = $1
+             ORDER BY approved_at, id",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
         let stage_history = sqlx::query_as(
             "SELECT id, request_id, target_community_id, stage, status, is_current,
                     started_at, finished_at, metadata_json, last_error, updated_at
@@ -68,14 +92,15 @@ impl EntityDeletionStore {
         tx.commit().await?;
         Ok(EntityInspection {
             request,
+            approvals,
             stage_history,
         })
     }
 
     /// Approve an inspected demo inventory and atomically create `gate_user`.
     ///
-    /// An identical retry is read-only. A different approver or digest cannot
-    /// replace approval evidence. The operator identity is self-asserted and
+    /// An identical retry is read-only. Another operator adds retained evidence
+    /// without restarting the workflow. The operator identity is self-asserted and
     /// this demo-only boundary does not authorize real user deletion.
     pub async fn approve(
         &self,
@@ -87,8 +112,7 @@ impl EntityDeletionStore {
         let mut tx = self.pool.begin().await?;
         let request: EntityRequest = sqlx::query_as(
             "SELECT id, entity_type, target, status, requested_by, reason, created_at, updated_at,
-                    inventory_manifest, inventory_digest, approved_by, approved_at,
-                    approved_inventory_digest
+                    inventory_manifest, inventory_digest
              FROM entity_deletion_requests WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
@@ -107,12 +131,17 @@ impl EntityDeletionStore {
             ));
         }
         if request.status == "approved" {
-            if request.approved_by.as_deref() != Some(approved_by)
-                || request.approved_inventory_digest.as_deref() != Some(digest.as_str())
-                || request.approved_at.is_none()
-            {
+            let has_approval: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM entity_deletion_approvals
+                 WHERE request_id = $1 AND inventory_digest = $2)",
+            )
+            .bind(id)
+            .bind(&digest)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !has_approval {
                 return Err(DbError::DeletionSafety(
-                    "approval already exists with different evidence".into(),
+                    "approved request has no approval for its saved inventory".into(),
                 ));
             }
             let has_current: bool = sqlx::query_scalar(
@@ -127,6 +156,7 @@ impl EntityDeletionStore {
                     "approved request has no current stage".into(),
                 ));
             }
+            save_approval(&mut tx, id, approved_by, &digest).await?;
             tx.commit().await?;
             return Ok(request);
         }
@@ -135,18 +165,15 @@ impl EntityDeletionStore {
         }
         let request = sqlx::query_as(
             "UPDATE entity_deletion_requests
-             SET status = 'approved', approved_by = $2, approved_at = now(),
-                 approved_inventory_digest = $3, updated_at = now()
+             SET status = 'approved', updated_at = now()
              WHERE id = $1
              RETURNING id, entity_type, target, status, requested_by, reason, created_at,
-                       updated_at, inventory_manifest, inventory_digest, approved_by,
-                       approved_at, approved_inventory_digest",
+                       updated_at, inventory_manifest, inventory_digest",
         )
         .bind(id)
-        .bind(approved_by)
-        .bind(digest)
         .fetch_one(&mut *tx)
         .await?;
+        save_approval(&mut tx, id, approved_by, &digest).await?;
         // An unexpected current row is an error, not an upsert: the whole
         // transaction must roll back instead of approving inconsistent state.
         sqlx::query(
@@ -159,4 +186,24 @@ impl EntityDeletionStore {
         tx.commit().await?;
         Ok(request)
     }
+}
+
+// The caller holds the parent row lock and has validated inventory and lifecycle.
+async fn save_approval(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request_id: Uuid,
+    approved_by: &str,
+    inventory_digest: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO entity_deletion_approvals (request_id, inventory_digest, approved_by)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (request_id, inventory_digest, approved_by) DO NOTHING",
+    )
+    .bind(request_id)
+    .bind(inventory_digest)
+    .bind(approved_by)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }

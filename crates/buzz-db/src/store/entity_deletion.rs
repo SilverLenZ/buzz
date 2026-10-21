@@ -31,12 +31,6 @@ pub struct EntityRequest {
     pub inventory_manifest: Option<serde_json::Value>,
     /// SHA-256 of the saved inventory.
     pub inventory_digest: Option<String>,
-    /// Self-asserted demo approver, not authenticated authorization for real deletion.
-    pub approved_by: Option<String>,
-    /// When the inventory was approved.
-    pub approved_at: Option<DateTime<Utc>>,
-    /// Inventory digest bound to the approval.
-    pub approved_inventory_digest: Option<String>,
 }
 
 /// Writer-database access to synthetic deletion requests.
@@ -79,8 +73,7 @@ impl EntityDeletionStore {
         .await?;
         let mut request: EntityRequest = sqlx::query_as(
             "SELECT id, entity_type, target, status, requested_by, reason, created_at, updated_at,
-                    inventory_manifest, inventory_digest, approved_by, approved_at,
-                    approved_inventory_digest
+                    inventory_manifest, inventory_digest
              FROM entity_deletion_requests WHERE entity_type = 'user' AND target = $1 FOR UPDATE",
         )
         .bind(target)
@@ -101,8 +94,7 @@ impl EntityDeletionStore {
                      updated_at = now()
                  WHERE id = $1
                  RETURNING id, entity_type, target, status, requested_by, reason, created_at,
-                           updated_at, inventory_manifest, inventory_digest, approved_by,
-                           approved_at, approved_inventory_digest",
+                           updated_at, inventory_manifest, inventory_digest",
             )
             .bind(request.id)
             .bind(inventory)
@@ -118,8 +110,7 @@ impl EntityDeletionStore {
     pub async fn get(&self, id: Uuid) -> Result<EntityRequest> {
         sqlx::query_as(
             "SELECT id, entity_type, target, status, requested_by, reason, created_at, updated_at,
-                    inventory_manifest, inventory_digest, approved_by, approved_at,
-                    approved_inventory_digest
+                    inventory_manifest, inventory_digest
              FROM entity_deletion_requests WHERE id = $1",
         )
         .bind(id)
@@ -132,8 +123,7 @@ impl EntityDeletionStore {
     pub async fn list(&self, limit: u16) -> Result<Vec<EntityRequest>> {
         Ok(sqlx::query_as(
             "SELECT id, entity_type, target, status, requested_by, reason, created_at, updated_at,
-                    inventory_manifest, inventory_digest, approved_by, approved_at,
-                    approved_inventory_digest
+                    inventory_manifest, inventory_digest
              FROM entity_deletion_requests ORDER BY created_at DESC, id LIMIT $1",
         )
         .bind(i64::from(limit.clamp(1, 1000)))
@@ -201,7 +191,7 @@ fn inventory_digest(inventory: &serde_json::Value) -> Result<String> {
 }
 
 mod approval;
-pub use approval::{EntityInspection, EntityStage};
+pub use approval::{EntityApproval, EntityInspection, EntityStage};
 
 #[cfg(test)]
 #[path = "entity_deletion_postgres_tests.rs"]

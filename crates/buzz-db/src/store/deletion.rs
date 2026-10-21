@@ -8269,10 +8269,24 @@ DROP FUNCTION community_write_fence_excluded_table(NAME);
             .submit("demo:history-retention", "operator", None)
             .await
             .unwrap();
+        db.entity_deletion_store()
+            .approve(
+                entity.id,
+                "approver",
+                entity.inventory_digest.as_deref().unwrap(),
+            )
+            .await
+            .unwrap();
+        let approvals_before = db
+            .entity_deletion_store()
+            .inspect(entity.id)
+            .await
+            .unwrap()
+            .approvals;
         let history_id: Uuid = sqlx::query_scalar(
             "INSERT INTO entity_deletion_stage_history
-             (request_id, target_community_id, stage)
-             VALUES ($1, $2, 'drain') RETURNING id",
+             (request_id, target_community_id, stage, is_current)
+             VALUES ($1, $2, 'drain', false) RETURNING id",
         )
         .bind(entity.id)
         .bind(community)
@@ -8320,6 +8334,16 @@ DROP FUNCTION community_write_fence_excluded_table(NAME);
         .await
         .unwrap();
         assert_eq!(retained, community);
+        let approvals_after = db
+            .entity_deletion_store()
+            .inspect(entity.id)
+            .await
+            .unwrap()
+            .approvals;
+        assert_eq!(
+            serde_json::to_value(approvals_before).unwrap(),
+            serde_json::to_value(approvals_after).unwrap()
+        );
 
         assert_eq!(deleted.get("relay_admin_outbox"), Some(&2));
         assert_eq!(deleted.get("relay_admin_actions"), Some(&2));
