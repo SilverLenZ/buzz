@@ -29,11 +29,13 @@ async fn count_kind(
         .len()
 }
 
-/// A change that fails after authorization stores nothing and changes
-/// nothing. A name longer than the 255-character column passes the relay's
-/// checks but fails the UPDATE. Before, the relay stored the event, applied
-/// `about`, skipped `topic`, and reported success; a resend then returned
-/// `duplicate:`. Mutation: store the event in its own transaction → RED.
+/// A change that fails inside the write stores nothing and changes nothing,
+/// and the same event succeeds once the failure is gone. A test trigger makes
+/// the topic UPDATE fail after the event row and the `about` change were
+/// written in the same transaction. Before, the relay stored the event,
+/// applied `about`, skipped `topic`, and reported success; a resend then
+/// returned `duplicate:`. Mutation: store the event in its own transaction
+/// → RED.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn failed_edit_stores_nothing() {
@@ -48,13 +50,24 @@ async fn failed_edit_stores_nothing() {
         .expect("channel");
     let notices_before = count_kind(&state, &tenant, channel_id, 40099).await;
 
-    let long_name = "n".repeat(256);
+    // Each test runs in its own database, so this trigger affects only it.
+    for statement in [
+        "CREATE FUNCTION edit_atomic_fail() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected topic failure'; END $$",
+        "CREATE TRIGGER edit_atomic_fail BEFORE UPDATE ON channels FOR EACH ROW \
+         WHEN (NEW.topic = 'fail-topic') EXECUTE FUNCTION edit_atomic_fail()",
+    ] {
+        sqlx::query(statement)
+            .execute(state.db.pool())
+            .await
+            .expect("install failure trigger");
+    }
+
     let event = EventBuilder::new(Kind::Custom(9002), "")
         .tags([
             Tag::parse(["h", &channel_id.to_string()]).unwrap(),
             Tag::parse(["about", "changed"]).unwrap(),
-            Tag::parse(["name", &long_name]).unwrap(),
-            Tag::parse(["topic", "changed"]).unwrap(),
+            Tag::parse(["topic", "fail-topic"]).unwrap(),
         ])
         .sign_with_keys(&owner)
         .expect("sign 9002");
@@ -71,21 +84,49 @@ async fn failed_edit_stores_nothing() {
                 "{attempt}: {error:?}"
             ),
         }
+        let after = state
+            .db
+            .get_channel(tenant.community(), channel_id)
+            .await
+            .expect("channel");
+        assert_eq!(
+            after.description, before.description,
+            "{attempt}: about is unchanged"
+        );
+        assert_eq!(after.topic, before.topic, "{attempt}: topic is unchanged");
+        assert_eq!(
+            count_kind(&state, &tenant, channel_id, 9002).await,
+            0,
+            "{attempt}"
+        );
+        assert_eq!(
+            count_kind(&state, &tenant, channel_id, 40099).await,
+            notices_before,
+            "{attempt}: no system message announces a change that did not happen"
+        );
     }
 
+    // With the failure gone, the same signed event applies in full.
+    sqlx::query("DROP TRIGGER edit_atomic_fail ON channels")
+        .execute(state.db.pool())
+        .await
+        .expect("drop failure trigger");
+    let retry = ingest_event(&state, &tenant, event, http_auth(&owner))
+        .await
+        .expect("retry");
+    assert!(retry.accepted, "{:?}", retry.message);
+    assert!(retry.message.is_empty(), "{:?}", retry.message);
     let after = state
         .db
         .get_channel(tenant.community(), channel_id)
         .await
         .expect("channel");
-    assert_eq!(after.name, before.name);
-    assert_eq!(after.description, before.description, "about is unchanged");
-    assert_eq!(after.topic, before.topic, "topic is unchanged");
-    assert_eq!(count_kind(&state, &tenant, channel_id, 9002).await, 0);
+    assert_eq!(after.description.as_deref(), Some("changed"));
+    assert_eq!(after.topic.as_deref(), Some("fail-topic"));
+    assert_eq!(count_kind(&state, &tenant, channel_id, 9002).await, 1);
     assert_eq!(
         count_kind(&state, &tenant, channel_id, 40099).await,
-        notices_before,
-        "no system message announces a change that did not happen"
+        notices_before + 1
     );
 }
 
@@ -201,6 +242,58 @@ async fn unarchive_of_an_active_channel_is_refused() {
         .await
         .expect("channel");
     assert!(channel.archived_at.is_none());
+    assert_eq!(count_kind(&state, &tenant, channel_id, 9002).await, 2);
+    assert_eq!(
+        count_kind(&state, &tenant, channel_id, 40099).await,
+        notices_before + 2
+    );
+}
+
+/// Resending a committed archive or unarchive is a duplicate, not a refusal.
+/// After the first send commits, the channel is already in the requested
+/// state, so validation alone would refuse the identical resend (a lost
+/// response would look like a failure). Mutation: drop the pre-validation
+/// duplicate check in ingest → RED ("channel is not archived").
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn resent_archive_and_unarchive_are_duplicates() {
+    let state = state().await;
+    let tenant = community(&state, "edit-atomic-archive-resend").await;
+    let owner = Keys::generate();
+    let channel_id = create_channel(&state, &tenant, &owner, &[]).await;
+    let notices_before = count_kind(&state, &tenant, channel_id, 40099).await;
+
+    for (value, archived) in [("true", true), ("false", false)] {
+        let event = EventBuilder::new(Kind::Custom(9002), "")
+            .tags([
+                Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+                Tag::parse(["archived", value]).unwrap(),
+            ])
+            .sign_with_keys(&owner)
+            .expect("sign 9002");
+        let first = ingest_event(&state, &tenant, event.clone(), http_auth(&owner))
+            .await
+            .expect("first send");
+        assert!(first.accepted, "archived={value}: {:?}", first.message);
+        assert!(
+            first.message.is_empty(),
+            "archived={value}: {:?}",
+            first.message
+        );
+
+        let resend = ingest_event(&state, &tenant, event, http_auth(&owner))
+            .await
+            .expect("resend");
+        assert!(resend.accepted, "archived={value}: {:?}", resend.message);
+        assert_eq!(resend.message, "duplicate:", "archived={value}");
+
+        let channel = state
+            .db
+            .get_channel(tenant.community(), channel_id)
+            .await
+            .expect("channel");
+        assert_eq!(channel.archived_at.is_some(), archived, "archived={value}");
+    }
     assert_eq!(count_kind(&state, &tenant, channel_id, 9002).await, 2);
     assert_eq!(
         count_kind(&state, &tenant, channel_id, 40099).await,

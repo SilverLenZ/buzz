@@ -2998,6 +2998,25 @@ async fn ingest_event_inner(
 
     validate_huddle_lifecycle_event(tenant, state, &event, kind_u32).await?;
 
+    // A resent kind:9002 that already committed is a duplicate. Check before
+    // the state-dependent checks below: after a committed unarchive, the
+    // channel is active and validation would refuse the identical resend.
+    // The atomic write repeats this check under the channel row lock.
+    if kind_u32 == KIND_NIP29_EDIT_METADATA
+        && state
+            .db
+            .get_event_by_id_for_event_write(tenant.community(), event.id.as_bytes())
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: database error: {e}")))?
+            .is_some()
+    {
+        return Ok(IngestResult {
+            event_id: event_id_hex,
+            accepted: true,
+            message: "duplicate:".into(),
+        });
+    }
+
     if crate::handlers::side_effects::is_admin_kind(kind_u32) {
         crate::handlers::side_effects::validate_admin_event(tenant, kind_u32, &event, state)
             .await
