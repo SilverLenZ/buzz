@@ -8,6 +8,25 @@ async fn store() -> EntityDeletionStore {
     }
 }
 
+async fn assert_plain_schema(pool: &PgPool) {
+    let fences: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_trigger
+         WHERE tgrelid = 'entity_deletion_requests'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("fences");
+    assert_eq!(fences, 0);
+    let foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint
+         WHERE conrelid = 'entity_deletion_requests'::regclass AND contype = 'f'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("foreign keys");
+    assert_eq!(foreign_keys, 0);
+}
+
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn concurrent_submissions_converge_and_conflicts_preserve_request() {
@@ -86,25 +105,9 @@ async fn invalid_submissions_do_not_create_rows() {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
-async fn desired_schema_registers_intake_without_community_fences() {
+async fn desired_schema_has_plain_intake_without_database_guards() {
     let store = store().await;
-    let registered: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM _operator_global_tables
-         WHERE table_name = 'entity_deletion_requests')",
-    )
-    .fetch_one(&store.pool)
-    .await
-    .expect("registry");
-    assert!(registered);
-    let fences: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_trigger
-         WHERE tgrelid = 'entity_deletion_requests'::regclass
-           AND tgname LIKE 'community_write_fence_%'",
-    )
-    .fetch_one(&store.pool)
-    .await
-    .expect("fences");
-    assert_eq!(fences, 0);
+    assert_plain_schema(&store.pool).await;
     crate::Db::from_pool(store.pool.clone())
         .validate_deletion_catalog()
         .await
@@ -145,6 +148,15 @@ async fn migration_schema_entity_intake_preserves_existing_data() {
     crate::migration::run_migrations(&store.pool)
         .await
         .expect("upgrade");
+    assert_plain_schema(&store.pool).await;
+    let registered: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM _operator_global_tables
+         WHERE table_name = 'entity_deletion_requests')",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .expect("registry");
+    assert!(registered);
     let request = store
         .submit("demo:alice", "operator-a", None)
         .await

@@ -2624,13 +2624,13 @@ mod postgres_tests {
     ///
     /// This bootstraps one probe database from `schema.sql` **through the real
     /// `bin/pgschema apply` binary** — the exact path CI (`ci.yml`) and both
-    /// test-relay launchers take — and migrates another through 1–38, then
-    /// asserts the three admin tables have identical column definitions (name,
-    /// type, nullability, default) and identical index shapes, including each
+    /// test-relay launchers take — and migrates another through the latest
+    /// migration, then asserts the admin and entity-intake tables have identical
+    /// column definitions (name, type, nullability, default) and index shapes, including each
     /// key's catalog sort/null options (`pg_index.indoption`). Columns are keyed
     /// by name, not ordinal, because migrations append via `ALTER TABLE` while
     /// `schema.sql` declares them inline — positions legitimately differ, shapes
-    /// must not.
+    /// must not. Entity-intake constraints are also compared in the live catalog.
     ///
     /// Driving the real binary is load-bearing: `pgschema` 1.7.4 discards
     /// per-key `NULLS FIRST`/`NULLS LAST` when it re-emits an index, so a naive
@@ -2686,6 +2686,21 @@ mod postgres_tests {
             .fetch_all(pool)
             .await
             .expect("read index shapes")
+        }
+
+        async fn constraints(pool: &PgPool, table: &str) -> Vec<(String, String, bool)> {
+            sqlx::query_as(
+                "SELECT con.conname, pg_get_constraintdef(con.oid), con.convalidated \
+                 FROM pg_constraint con \
+                 JOIN pg_class t ON t.oid = con.conrelid \
+                 JOIN pg_namespace n ON n.oid = t.relnamespace \
+                 WHERE n.nspname = 'public' AND t.relname = $1 \
+                 ORDER BY con.conname",
+            )
+            .bind(table)
+            .fetch_all(pool)
+            .await
+            .expect("read constraint definitions")
         }
 
         let base_url = std::env::var("BUZZ_TEST_DATABASE_URL")
@@ -2755,18 +2770,25 @@ mod postgres_tests {
         let desired = PgPool::connect(&format!("{base_prefix}/{desired_db}"))
             .await
             .expect("connect desired-state probe database");
+        sqlx::raw_sql(include_str!(
+            "../../../../scripts/reconcile-schema-after-pgschema.sql"
+        ))
+        .execute(&desired)
+        .await
+        .expect("reconcile desired-state probe database");
         let migrated = PgPool::connect(&format!("{base_prefix}/{migrated_db}"))
             .await
             .expect("connect migrated probe database");
         MIGRATOR
-            .run_to(55, &migrated)
+            .run(&migrated)
             .await
-            .expect("apply migrations 1-55");
+            .expect("apply migrations for schema parity");
 
         for table in [
             "relay_admin_actions",
             "relay_admin_outbox",
             "relay_operator_audit",
+            "entity_deletion_requests",
         ] {
             assert_eq!(
                 columns(&desired, table).await,
@@ -2783,6 +2805,12 @@ mod postgres_tests {
                  migration and schema.sql must both use a representable shape."
             );
         }
+
+        assert_eq!(
+            constraints(&desired, "entity_deletion_requests").await,
+            constraints(&migrated, "entity_deletion_requests").await,
+            "constraint parity mismatch for entity_deletion_requests"
+        );
 
         desired.close().await;
         migrated.close().await;

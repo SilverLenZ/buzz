@@ -1,3 +1,5 @@
+SET LOCAL lock_timeout = '5s';
+
 -- Synthetic request intake only; no deletion worker or user cleanup.
 
 -- Operator-global intake for synthetic user-deletion requests.
