@@ -300,3 +300,51 @@ async fn resent_archive_and_unarchive_are_duplicates() {
         notices_before + 2
     );
 }
+
+/// A kind:9002 `join_role` change goes through the same transaction as the
+/// other settings: it is stored, and it is announced by one
+/// `join_role_changed` system message. Mutation: drop the `join_role` arm
+/// from the edit → RED (the event changes nothing).
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn join_role_edit_is_applied_and_announced() {
+    let state = state().await;
+    let tenant = community(&state, "edit-atomic-join-role").await;
+    let owner = Keys::generate();
+    let channel_id = create_channel(&state, &tenant, &owner, &[]).await;
+    let notices_before = count_kind(&state, &tenant, channel_id, 40099).await;
+
+    let event = EventBuilder::new(Kind::Custom(9002), "")
+        .tags([
+            Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+            Tag::parse(["join_role", "guest"]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .expect("sign 9002");
+    let result = ingest_event(&state, &tenant, event, http_auth(&owner))
+        .await
+        .expect("ingest");
+    assert!(result.accepted, "{:?}", result.message);
+
+    let after = state
+        .db
+        .get_channel(tenant.community(), channel_id)
+        .await
+        .expect("channel");
+    assert_eq!(after.join_role, "guest");
+    let notices = state
+        .db
+        .query_events(&EventQuery {
+            kinds: Some(vec![40099]),
+            channel_id: Some(channel_id),
+            ..EventQuery::for_community(tenant.community())
+        })
+        .await
+        .expect("query events");
+    assert_eq!(notices.len(), notices_before + 1);
+    let announced = notices
+        .iter()
+        .filter_map(|stored| serde_json::from_str::<serde_json::Value>(&stored.event.content).ok())
+        .any(|content| content["type"] == "join_role_changed" && content["join_role"] == "guest");
+    assert!(announced, "one join_role_changed system message");
+}

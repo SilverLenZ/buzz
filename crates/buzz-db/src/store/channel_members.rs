@@ -3386,6 +3386,25 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn join_role_change_waits_for_a_roster_publication_on_an_ephemeral_channel() {
+        join_role_change_waits_for_roster_publication(SettingsWriter::UpdateChannel).await;
+    }
+
+    /// The kind:9002 path stores the event and applies its changes in its own
+    /// transaction. It must take the same locks in the same order as
+    /// `update_channel`.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn kind_9002_join_role_change_waits_for_a_roster_publication_on_an_ephemeral_channel() {
+        join_role_change_waits_for_roster_publication(SettingsWriter::Kind9002).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum SettingsWriter {
+        UpdateChannel,
+        Kind9002,
+    }
+
+    async fn join_role_change_waits_for_roster_publication(writer: SettingsWriter) {
         let pool = setup_pool().await;
         let community_id = make_test_community(&pool).await;
         let community = CommunityId::from_uuid(community_id);
@@ -3424,19 +3443,45 @@ mod postgres_tests {
             let pool = pool.clone();
             let channel_id = channel.id;
             async move {
-                crate::channel::update_channel(
-                    &pool,
-                    community,
-                    channel_id,
-                    crate::channel::ChannelUpdate {
-                        join_role: Some("guest".into()),
-                        ..Default::default()
-                    },
-                )
-                .await
+                let updates = crate::channel::ChannelUpdate {
+                    join_role: Some("guest".into()),
+                    ..Default::default()
+                };
+                match writer {
+                    SettingsWriter::UpdateChannel => {
+                        crate::channel::update_channel(&pool, community, channel_id, updates).await
+                    }
+                    SettingsWriter::Kind9002 => {
+                        let edit_event = nostr::EventBuilder::new(nostr::Kind::Custom(9002), "")
+                            .tags(vec![
+                                nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag"),
+                                nostr::Tag::parse(["join_role", "guest"]).expect("join_role tag"),
+                            ])
+                            .sign_with_keys(&Keys::generate())
+                            .expect("sign kind:9002");
+                        let write = crate::channel::apply_channel_metadata_event(
+                            &pool,
+                            None,
+                            community,
+                            channel_id,
+                            &edit_event,
+                            crate::channel::ChannelMetadataEdit {
+                                columns: updates,
+                                ..Default::default()
+                            },
+                            &[],
+                        )
+                        .await?;
+                        assert!(write.inserted, "the kind:9002 event must be stored");
+                        crate::channel::get_channel(&pool, community, channel_id).await
+                    }
+                }
             }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // The kind:9002 writer also stores an event before it would reach
+        // the row, so give an unblocked writer time to finish. A blocked
+        // writer waits until the roster commits, so this cannot pass early.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert!(
             !update.is_finished(),
             "the join_role change must wait for the roster publication"

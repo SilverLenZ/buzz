@@ -864,9 +864,8 @@ impl ChannelSettingsLock {
     /// Refuse `updates` if this lock does not cover them. This catches a
     /// caller that took the lock for one set of changes and then writes
     /// another set.
-    fn check_covers(&self, channel_id: Uuid, updates: &ChannelUpdate) -> Result<()> {
-        let covered = self.channel_id == channel_id
-            && (self.admission || !updates.changes_admission())
+    fn check_covers(&self, updates: &ChannelUpdate) -> Result<()> {
+        let covered = (self.admission || !updates.changes_admission())
             && (matches!(self.ttl, TtlLock::Exclusive) || updates.ttl_seconds.is_none());
         if covered {
             Ok(())
@@ -890,7 +889,7 @@ impl ChannelSettingsLock {
 ///    (`event_follow_up::refresh_channel_ttls`, which reads `ttl_seconds`
 ///    under the SHARED lock). With the EXCLUSIVE lock, a concurrent event
 ///    either sees the new TTL or commits before this change.
-/// 3. the channel row, `FOR UPDATE`.
+/// 3. the channel row, `FOR NO KEY UPDATE`.
 ///
 /// Roster publication holds the membership lock and then, at commit, takes
 /// the TTL lock and updates the row. A huddle join takes the membership
@@ -919,9 +918,12 @@ pub(crate) async fn lock_channel_for_settings_write(
         TtlLock::Shared
     };
     lock_channel_ttl(tx, channel_id, ttl).await?;
+    // `FOR NO KEY UPDATE`, like a huddle join: it orders this write against
+    // every other settings write and a huddle join, but not against the
+    // `KEY SHARE` lock that a membership INSERT takes for its foreign key.
     let previous_visibility: String = sqlx::query_scalar(
         "SELECT visibility::text FROM channels \
-         WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL FOR UPDATE",
+         WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL FOR NO KEY UPDATE",
     )
     .bind(community_id.as_uuid())
     .bind(channel_id)
@@ -943,8 +945,8 @@ async fn update_channel_on(
     locked: &ChannelSettingsLock,
     mut updates: ChannelUpdate,
 ) -> Result<()> {
+    locked.check_covers(&updates)?;
     let channel_id = locked.channel_id;
-    locked.check_covers(channel_id, &updates)?;
     let community_id = tx.community();
     if let Some(name) = updates.name.as_mut() {
         *name = buzz_core::channel::canonical_channel_name(name).to_owned();
