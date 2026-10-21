@@ -11,7 +11,8 @@ async fn store() -> EntityDeletionStore {
 async fn assert_plain_schema(pool: &PgPool) {
     let fences: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_trigger
-         WHERE tgrelid = 'entity_deletion_requests'::regclass",
+         WHERE tgrelid IN ('entity_deletion_requests'::regclass,
+                           'entity_deletion_stage_history'::regclass)",
     )
     .fetch_one(pool)
     .await
@@ -19,7 +20,8 @@ async fn assert_plain_schema(pool: &PgPool) {
     assert_eq!(fences, 0);
     let foreign_keys: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_constraint
-         WHERE conrelid = 'entity_deletion_requests'::regclass AND contype = 'f'",
+         WHERE conrelid IN ('entity_deletion_requests'::regclass,
+                            'entity_deletion_stage_history'::regclass) AND contype = 'f'",
     )
     .fetch_one(pool)
     .await
@@ -38,7 +40,7 @@ async fn concurrent_submissions_converge_and_conflicts_preserve_request() {
     let first = first.expect("first submission");
     let second = second.expect("concurrent submission");
     assert_eq!(first.id, second.id);
-    assert_eq!(first.status, "submitted");
+    assert_eq!(first.status, "inventoried");
     assert_eq!(first.entity_type, "user");
     assert_eq!(first.created_at, second.created_at);
     assert_eq!(first.updated_at, second.updated_at);
@@ -182,4 +184,195 @@ async fn migration_schema_entity_intake_preserves_existing_data() {
         .validate_deletion_catalog()
         .await
         .expect("community catalog");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn approval_is_atomic_idempotent_and_bound_to_inventory() {
+    let store = store().await;
+    let request = store
+        .submit("demo:approval", "operator-a", None)
+        .await
+        .unwrap();
+    let digest = request.inventory_digest.as_deref().unwrap();
+    let before = store.inspect(request.id).await.unwrap();
+    assert!(before.stage_history.is_empty());
+    let inventory = before.request.inventory_manifest.as_ref().unwrap();
+    assert_eq!(inventory["communities"][0]["relationship"], "participant");
+    assert_eq!(
+        inventory["communities"][1]["relationship"],
+        "former_participant"
+    );
+    for (actor, hash) in [("operator-b", "wrong"), (" operator-b", digest)] {
+        assert!(store.approve(request.id, actor, hash).await.is_err());
+        assert_eq!(
+            serde_json::to_value(store.inspect(request.id).await.unwrap()).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+    }
+    let (a, b) = tokio::join!(
+        store.approve(request.id, "operator-b", digest),
+        store.approve(request.id, "operator-b", digest),
+    );
+    let approved = a.unwrap();
+    assert_eq!(approved.status, "approved");
+    assert_eq!(approved.approved_at, b.unwrap().approved_at);
+    assert_eq!(approved.approved_inventory_digest.as_deref(), Some(digest));
+    let after = store.inspect(request.id).await.unwrap();
+    assert_eq!(after.stage_history.len(), 1);
+    let stage = &after.stage_history[0];
+    assert_eq!(stage.request_id, request.id);
+    assert_eq!(stage.stage, "gate_user");
+    assert_eq!(stage.status, "pending");
+    assert!(stage.is_current);
+    assert!(stage.target_community_id.is_none());
+    assert!(stage.started_at.is_none());
+    assert!(stage.finished_at.is_none());
+    assert_eq!(stage.metadata_json, serde_json::json!({}));
+    assert!(store
+        .approve(request.id, "operator-c", digest)
+        .await
+        .is_err());
+    store
+        .submit("demo:approval", "operator-a", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(store.inspect(request.id).await.unwrap()).unwrap(),
+        serde_json::to_value(&after).unwrap()
+    );
+    // The invariant is enforced by the live partial unique index.
+    assert!(sqlx::query(
+        "INSERT INTO entity_deletion_stage_history (request_id, stage) VALUES ($1, 'drain')"
+    )
+    .bind(request.id)
+    .execute(&store.pool)
+    .await
+    .is_err());
+    // A missing parent is rejected by application code, without a foreign key.
+    assert!(matches!(
+        store.approve(Uuid::new_v4(), "operator-b", digest).await,
+        Err(DbError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn approval_rolls_back_when_starting_stage_cannot_be_saved() {
+    let store = store().await;
+    let request = store
+        .submit("demo:rollback", "operator-a", None)
+        .await
+        .unwrap();
+    // Fault injection: a current row makes the final INSERT fail after the
+    // approval UPDATE. The production transaction must roll back that UPDATE.
+    sqlx::query(
+        "INSERT INTO entity_deletion_stage_history (request_id, stage) VALUES ($1, 'unexpected')",
+    )
+    .bind(request.id)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    let before = store.inspect(request.id).await.unwrap();
+    assert!(store
+        .approve(
+            request.id,
+            "operator-b",
+            request.inventory_digest.as_deref().unwrap()
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        serde_json::to_value(store.inspect(request.id).await.unwrap()).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn approval_refuses_changed_inventory_and_missing_resume_position() {
+    let store = store().await;
+    let request = store
+        .submit("demo:changed", "operator-a", None)
+        .await
+        .unwrap();
+    let digest = request.inventory_digest.as_deref().unwrap();
+    let mut inventory = request.inventory_manifest.clone().unwrap();
+    inventory["communities"].as_array_mut().unwrap().reverse();
+    sqlx::query("UPDATE entity_deletion_requests SET inventory_manifest = $2 WHERE id = $1")
+        .bind(request.id)
+        .bind(&inventory)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert!(store
+        .approve(request.id, "operator-b", digest)
+        .await
+        .is_err());
+    assert_eq!(store.get(request.id).await.unwrap().status, "inventoried");
+    sqlx::query("UPDATE entity_deletion_requests SET inventory_manifest = $2 WHERE id = $1")
+        .bind(request.id)
+        .bind(&request.inventory_manifest)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    store
+        .approve(request.id, "operator-b", digest)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM entity_deletion_stage_history WHERE request_id = $1")
+        .bind(request.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert!(store
+        .approve(request.id, "operator-b", digest)
+        .await
+        .is_err());
+    assert!(store
+        .inspect(request.id)
+        .await
+        .unwrap()
+        .stage_history
+        .is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn migration_schema_approval_preserves_legacy_intake_and_resubmission_prepares_it() {
+    let store = store().await;
+    crate::migration::run_migrations_through(&store.pool, 68)
+        .await
+        .unwrap();
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO entity_deletion_requests (target, requested_by) VALUES ('demo:legacy', 'operator-a') RETURNING id")
+        .fetch_one(&store.pool).await.unwrap();
+    crate::migration::run_migrations(&store.pool).await.unwrap();
+    let before = store.inspect(id).await.unwrap();
+    assert_eq!(before.request.status, "submitted");
+    assert!(before.request.inventory_manifest.is_none());
+    assert!(before.stage_history.is_empty());
+    assert!(store.approve(id, "operator-b", "unknown").await.is_err());
+    let prepared = store
+        .submit("demo:legacy", "operator-a", None)
+        .await
+        .unwrap();
+    assert_eq!(prepared.id, id);
+    assert_eq!(prepared.created_at, before.request.created_at);
+    store
+        .approve(
+            id,
+            "operator-b",
+            prepared.inventory_digest.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_plain_schema(&store.pool).await;
+    let registered: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM _operator_global_tables WHERE table_name = 'entity_deletion_stage_history')")
+        .fetch_one(&store.pool).await.unwrap();
+    assert!(registered);
+    // The previous CLI's INSERT remains valid after the upgrade.
+    sqlx::query("INSERT INTO entity_deletion_requests (target, requested_by) VALUES ('demo:old-cli', 'operator-a')")
+        .execute(&store.pool).await.unwrap();
 }

@@ -1,10 +1,10 @@
-//! PostgreSQL-only intake commands for synthetic user-deletion requests.
+//! PostgreSQL-only intake and approval for synthetic user-deletion requests.
 
 use anyhow::Result;
 use clap::Subcommand;
 use uuid::Uuid;
 
-/// Submit and inspect synthetic requests; these commands never execute deletion.
+/// Prepare and approve synthetic requests; these commands never execute deletion.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Save a request. An identical resubmission returns the existing row.
@@ -18,6 +18,17 @@ pub enum Command {
         /// Optional explanation.
         #[arg(long)]
         reason: Option<String>,
+    },
+    /// Approve the saved demo inventory and create its first pending stage.
+    Approve {
+        /// Request UUID returned by submit.
+        id: Uuid,
+        /// Approving operator identity (self-asserted for this demo).
+        #[arg(long)]
+        approved_by: String,
+        /// Inventory digest from inspect; approval must match this exact inventory.
+        #[arg(long)]
+        inventory_digest: String,
     },
     /// List synthetic requests, newest first.
     List {
@@ -46,8 +57,16 @@ pub async fn run(command: Command) -> Result<i32> {
                 .submit(&target, &requested_by, reason.as_deref())
                 .await?,
         )?,
+        Command::Approve {
+            id,
+            approved_by,
+            inventory_digest,
+        } => {
+            store.approve(id, &approved_by, &inventory_digest).await?;
+            crate::print_json(&store.inspect(id).await?)?;
+        }
         Command::List { limit } => crate::print_json(&store.list(limit).await?)?,
-        Command::Inspect { id } => crate::print_json(&store.get(id).await?)?,
+        Command::Inspect { id } => crate::print_json(&store.inspect(id).await?)?,
     }
     Ok(0)
 }

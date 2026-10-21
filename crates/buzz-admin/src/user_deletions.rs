@@ -23,6 +23,16 @@ mod tests {
                 "--requested-by",
                 "operator-a",
             ],
+            vec![
+                "buzz-admin",
+                "user-deletions",
+                "approve",
+                "00000000-0000-0000-0000-000000000001",
+                "--approved-by",
+                "operator-b",
+                "--inventory-digest",
+                "digest-from-inspect",
+            ],
             vec!["buzz-admin", "user-deletions", "list"],
             vec![
                 "buzz-admin",
@@ -33,7 +43,16 @@ mod tests {
         ] {
             assert!(crate::Cli::try_parse_from(args).is_ok());
         }
-        for command in ["inventory", "approve", "run", "drain", "worker"] {
+        assert!(crate::Cli::try_parse_from([
+            "buzz-admin",
+            "user-deletions",
+            "approve",
+            "00000000-0000-0000-0000-000000000001",
+            "--approved-by",
+            "operator-b",
+        ])
+        .is_err());
+        for command in ["inventory", "run", "drain", "worker"] {
             assert!(crate::Cli::try_parse_from(["buzz-admin", "user-deletions", command]).is_err());
         }
     }

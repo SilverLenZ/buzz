@@ -3,10 +3,15 @@ CREATE TABLE entity_deletion_requests (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     entity_type TEXT NOT NULL DEFAULT 'user' CHECK (entity_type = 'user'),
     target TEXT NOT NULL CHECK (target ~ '^demo:[a-z0-9][a-z0-9_-]{0,63}$'),
-    status TEXT NOT NULL DEFAULT 'submitted' CHECK (status = 'submitted'),
+    status TEXT NOT NULL DEFAULT 'submitted' CHECK (status IN ('submitted', 'inventoried', 'approved')),
     requested_by TEXT NOT NULL CHECK (length(trim(requested_by)) BETWEEN 1 AND 256),
     reason TEXT CHECK (octet_length(reason) <= 4096),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    inventory_manifest JSONB,
+    inventory_digest TEXT,
+    approved_by TEXT,
+    approved_at TIMESTAMPTZ,
+    approved_inventory_digest TEXT,
     UNIQUE (entity_type, target)
 );

@@ -8262,6 +8262,23 @@ DROP FUNCTION community_write_fence_excluded_table(NAME);
             .as_uuid()
             .to_owned();
         seed_relay_admin_rows(&db, bystander).await;
+        // Operator workflow history is retained even when its provenance
+        // community is purged; it is not a tenant-owned serving table.
+        let entity = db
+            .entity_deletion_store()
+            .submit("demo:history-retention", "operator", None)
+            .await
+            .unwrap();
+        let history_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO entity_deletion_stage_history
+             (request_id, target_community_id, stage)
+             VALUES ($1, $2, 'drain') RETURNING id",
+        )
+        .bind(entity.id)
+        .bind(community)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
         let live = store
             .inventory_schema(request.community_id)
             .await
@@ -8294,6 +8311,15 @@ DROP FUNCTION community_write_fence_excluded_table(NAME);
             .await
             .expect("bindings");
         let deleted = store.purge_postgres(&token).await.expect("purge postgres");
+
+        let retained: Uuid = sqlx::query_scalar(
+            "SELECT target_community_id FROM entity_deletion_stage_history WHERE id = $1",
+        )
+        .bind(history_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, community);
 
         assert_eq!(deleted.get("relay_admin_outbox"), Some(&2));
         assert_eq!(deleted.get("relay_admin_actions"), Some(&2));
