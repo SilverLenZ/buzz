@@ -3573,27 +3573,32 @@ async fn republish_roster_candidates(
     }
 }
 
-/// Republish the kind:39002 roster of each channel in `channels`, for example
-/// after recording an agent owner turned the agent's `member` rows into `bot`.
+/// Republish, in the background, the kind:39002 roster of each channel in
+/// `channels`, for example after recording an agent owner turned the agent's
+/// `member` rows into `bot`.
 ///
 /// Each roster is captured and replaced under the channel's membership lock,
-/// like every other roster writer. A failure is logged and counted and does
-/// not stop the other channels; [`reconcile_ordinary_role_rosters`] repairs
-/// any roster left stale at the next startup.
-pub async fn republish_channel_rosters(
+/// like every other roster writer. That lock can wait up to the lock timeout,
+/// so the caller does not wait: first AUTH must finish inside its own
+/// deadline. A failure is logged and counted and does not stop the other
+/// channels; [`reconcile_ordinary_role_rosters`] repairs any roster left
+/// stale (including by a relay that stopped first) at the next startup.
+pub fn spawn_channel_roster_republish(
     tenant: &TenantContext,
     state: &Arc<AppState>,
-    channels: &[uuid::Uuid],
+    channels: Vec<uuid::Uuid>,
 ) {
-    republish_roster_candidates(
-        state,
-        channels
-            .iter()
-            .map(|&channel_id| (tenant.community(), tenant.host().to_owned(), channel_id))
-            .collect(),
-        "channel roster republish failed",
-    )
-    .await;
+    if channels.is_empty() {
+        return;
+    }
+    let candidates = channels
+        .into_iter()
+        .map(|channel_id| (tenant.community(), tenant.host().to_owned(), channel_id))
+        .collect();
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        republish_roster_candidates(&state, candidates, "channel roster republish failed").await;
+    });
 }
 
 /// Reconcile channels that exist in the DB but don't have kind:39000 events.

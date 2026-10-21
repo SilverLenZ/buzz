@@ -459,13 +459,15 @@ pub mod relay_members {
                 // at revoke time; make them reconnect with the owner attached.
                 state.disconnect_unowned_agent_clusterwide(tenant, &agent.to_bytes());
                 // Recording the owner turned the agent's `member` rows into
-                // `bot`; publish those rosters so they match the rows.
-                crate::handlers::side_effects::republish_channel_rosters(
+                // `bot`; publish those rosters so they match the rows. The
+                // owner write above is the admission fact; the rosters follow
+                // in the background so a contended roster lock cannot hold
+                // first AUTH past its deadline.
+                crate::handlers::side_effects::spawn_channel_roster_republish(
                     tenant,
                     state,
-                    &record.converted_channels,
-                )
-                .await;
+                    record.converted_channels,
+                );
                 true
             }
             Ok(_) => state
