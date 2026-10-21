@@ -2998,25 +2998,6 @@ async fn ingest_event_inner(
 
     validate_huddle_lifecycle_event(tenant, state, &event, kind_u32).await?;
 
-    // A resent kind:9002 that already committed is a duplicate. Check before
-    // the state-dependent checks below: after a committed unarchive, the
-    // channel is active and validation would refuse the identical resend.
-    // The atomic write repeats this check under the channel row lock.
-    if kind_u32 == KIND_NIP29_EDIT_METADATA
-        && state
-            .db
-            .get_event_by_id_for_event_write(tenant.community(), event.id.as_bytes())
-            .await
-            .map_err(|e| IngestError::Internal(format!("error: database error: {e}")))?
-            .is_some()
-    {
-        return Ok(IngestResult {
-            event_id: event_id_hex,
-            accepted: true,
-            message: "duplicate:".into(),
-        });
-    }
-
     if crate::handlers::side_effects::is_admin_kind(kind_u32) {
         crate::handlers::side_effects::validate_admin_event(tenant, kind_u32, &event, state)
             .await
@@ -3050,17 +3031,15 @@ async fn ingest_event_inner(
     }
 
     if channel_id.is_some() {
-        // Allow kind:9002 with archived=false (unarchive operation)
-        let is_unarchive = kind_u32 == KIND_NIP29_EDIT_METADATA
-            && event.tags.iter().any(|t| {
-                let parts = t.as_slice();
-                parts.len() >= 2 && parts[0] == "archived" && parts[1] == "false"
-            });
+        // kind:9002 is not checked here: its atomic write decides the
+        // archive state under the channel row lock, after its duplicate
+        // check, so a resend that races the first commit is a duplicate.
+        let is_edit_metadata = kind_u32 == KIND_NIP29_EDIT_METADATA;
 
         // A member may still leave an archived channel by themselves.
         let is_self_departure = crate::handlers::side_effects::is_self_departure(&event);
 
-        if !is_unarchive && !is_self_departure {
+        if !is_edit_metadata && !is_self_departure {
             if let Some(channel) = &channel_row {
                 if channel.archived_at.is_some() {
                     return Err(match target_denial {
@@ -3545,9 +3524,16 @@ async fn ingest_event_inner(
     } else if kind_u32 == KIND_NIP29_EDIT_METADATA {
         // One commit stores the event and applies its channel changes. A
         // failure stores nothing, so the client is told and can resend it.
+        // A refusal decided under the lock (for example, restoring a channel
+        // that is not archived) is the client's error; anything else is ours.
         crate::handlers::side_effects::persist_edit_metadata(tenant, &event, state)
             .await
-            .map_err(|e| IngestError::Internal(format!("error: channel update failed: {e}")))?
+            .map_err(|e| match e.downcast_ref::<buzz_db::DbError>() {
+                Some(buzz_db::DbError::AccessDenied(reason)) => {
+                    IngestError::Rejected(format!("invalid: {reason}"))
+                }
+                _ => IngestError::Internal(format!("error: channel update failed: {e}")),
+            })?
     } else if buzz_core::kind::is_replaceable(kind_u32) {
         // NIP-16 replaceable event — atomic replace with stale-write protection.
         // channel_id is None for global kinds (0, 1, 3) due to step 5b above.

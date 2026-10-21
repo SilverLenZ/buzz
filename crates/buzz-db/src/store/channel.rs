@@ -808,8 +808,8 @@ pub async fn update_channel(
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    let locked = lock_channel_for_settings_write(&mut tx, channel_id, &updates).await?;
-    update_channel_on(&mut tx, &locked, updates).await?;
+    let mut locked = lock_channel_for_settings_write(&mut tx, channel_id, &updates).await?;
+    update_channel_on(&mut locked, updates).await?;
     tx.commit().await?;
 
     get_channel_with_operation(
@@ -844,21 +844,37 @@ async fn lock_channel_ttl(
     Ok(())
 }
 
-/// Proof that a transaction holds the locks a channel settings write needs.
-/// Only [`lock_channel_for_settings_write`] makes one, and every function
-/// that writes channel settings takes one. So a new settings writer cannot
-/// skip a lock or take the locks in a different order.
-pub(crate) struct ChannelSettingsLock {
+/// The only way to write a channel's settings. Only
+/// [`lock_channel_for_settings_write`] makes one, after it takes the locks
+/// on the transaction it borrows, and every settings write is a method on
+/// it. The borrow binds the locks to that transaction: a writer cannot use
+/// them with another transaction or after its commit, skip a lock, or take
+/// the locks in a different order.
+pub(crate) struct ChannelSettingsWriter<'tx> {
+    tx: &'tx mut crate::AdmittedTx,
     channel_id: Uuid,
     admission: bool,
     ttl: TtlLock,
     previous_visibility: String,
+    archived: bool,
 }
 
-impl ChannelSettingsLock {
+impl ChannelSettingsWriter<'_> {
     /// The channel's visibility when the lock was taken (`"open"` or `"private"`).
     pub(crate) fn previous_visibility(&self) -> &str {
         &self.previous_visibility
+    }
+
+    /// Whether the channel was archived when the lock was taken. The row
+    /// lock keeps this current until the transaction ends.
+    pub(crate) fn archived(&self) -> bool {
+        self.archived
+    }
+
+    /// The locked transaction, for writes that are not channel settings
+    /// (for example, storing the event that requested the change).
+    pub(crate) fn tx(&mut self) -> &mut crate::AdmittedTx {
+        self.tx
     }
 
     /// Refuse `updates` if this lock does not cover them. This catches a
@@ -897,11 +913,11 @@ impl ChannelSettingsLock {
 /// any other order could wait for one of them while it waits for this one.
 ///
 /// Returns `ChannelNotFound` when the channel is missing or deleted.
-pub(crate) async fn lock_channel_for_settings_write(
-    tx: &mut crate::AdmittedTx,
+pub(crate) async fn lock_channel_for_settings_write<'tx>(
+    tx: &'tx mut crate::AdmittedTx,
     channel_id: Uuid,
     updates: &ChannelUpdate,
-) -> Result<ChannelSettingsLock> {
+) -> Result<ChannelSettingsWriter<'tx>> {
     let community_id = tx.community();
     let admission = updates.changes_admission();
     if admission {
@@ -921,8 +937,8 @@ pub(crate) async fn lock_channel_for_settings_write(
     // `FOR NO KEY UPDATE`, like a huddle join: it orders this write against
     // every other settings write and a huddle join, but not against the
     // `KEY SHARE` lock that a membership INSERT takes for its foreign key.
-    let previous_visibility: String = sqlx::query_scalar(
-        "SELECT visibility::text FROM channels \
+    let (previous_visibility, archived): (String, bool) = sqlx::query_as(
+        "SELECT visibility::text, archived_at IS NOT NULL FROM channels \
          WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL FOR NO KEY UPDATE",
     )
     .bind(community_id.as_uuid())
@@ -930,23 +946,25 @@ pub(crate) async fn lock_channel_for_settings_write(
     .fetch_optional(tx.conn())
     .await?
     .ok_or(DbError::ChannelNotFound(channel_id))?;
-    Ok(ChannelSettingsLock {
+    Ok(ChannelSettingsWriter {
+        tx,
         channel_id,
         admission,
         ttl,
         previous_visibility,
+        archived,
     })
 }
 
 /// Writes the set fields of `updates` to the locked channel row on `tx`.
 /// The caller owns the commit.
 async fn update_channel_on(
-    tx: &mut crate::AdmittedTx,
-    locked: &ChannelSettingsLock,
+    w: &mut ChannelSettingsWriter<'_>,
     mut updates: ChannelUpdate,
 ) -> Result<()> {
-    locked.check_covers(&updates)?;
-    let channel_id = locked.channel_id;
+    w.check_covers(&updates)?;
+    let channel_id = w.channel_id;
+    let tx = &mut *w.tx;
     let community_id = tx.community();
     if let Some(name) = updates.name.as_mut() {
         *name = buzz_core::channel::canonical_channel_name(name).to_owned();
@@ -1040,20 +1058,16 @@ pub async fn set_topic(
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    let locked =
+    let mut locked =
         lock_channel_for_settings_write(&mut tx, channel_id, &ChannelUpdate::default()).await?;
-    set_topic_on(&mut tx, &locked, topic, set_by).await?;
+    set_topic_on(&mut locked, topic, set_by).await?;
     tx.commit().await?;
     Ok(())
 }
 
-async fn set_topic_on(
-    tx: &mut crate::AdmittedTx,
-    locked: &ChannelSettingsLock,
-    topic: &str,
-    set_by: &[u8],
-) -> Result<()> {
-    let channel_id = locked.channel_id;
+async fn set_topic_on(w: &mut ChannelSettingsWriter<'_>, topic: &str, set_by: &[u8]) -> Result<()> {
+    let channel_id = w.channel_id;
+    let tx = &mut *w.tx;
     let result = sqlx::query(
         "UPDATE channels SET topic = $1, topic_set_by = $2, topic_set_at = NOW() \
          WHERE community_id = $3 AND id = $4 AND deleted_at IS NULL",
@@ -1084,20 +1098,20 @@ pub async fn set_purpose(
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    let locked =
+    let mut locked =
         lock_channel_for_settings_write(&mut tx, channel_id, &ChannelUpdate::default()).await?;
-    set_purpose_on(&mut tx, &locked, purpose, set_by).await?;
+    set_purpose_on(&mut locked, purpose, set_by).await?;
     tx.commit().await?;
     Ok(())
 }
 
 async fn set_purpose_on(
-    tx: &mut crate::AdmittedTx,
-    locked: &ChannelSettingsLock,
+    w: &mut ChannelSettingsWriter<'_>,
     purpose: &str,
     set_by: &[u8],
 ) -> Result<()> {
-    let channel_id = locked.channel_id;
+    let channel_id = w.channel_id;
+    let tx = &mut *w.tx;
     let result = sqlx::query(
         "UPDATE channels SET purpose = $1, purpose_set_by = $2, purpose_set_at = NOW() \
          WHERE community_id = $3 AND id = $4 AND deleted_at IS NULL",
@@ -1129,9 +1143,9 @@ pub async fn archive_channel(
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    let locked =
+    let mut locked =
         lock_channel_for_settings_write(&mut tx, channel_id, &ChannelUpdate::default()).await?;
-    set_archived_on(&mut tx, &locked, true).await?;
+    set_archived_on(&mut locked, true).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1151,9 +1165,9 @@ pub async fn unarchive_channel(
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    let locked =
+    let mut locked =
         lock_channel_for_settings_write(&mut tx, channel_id, &ChannelUpdate::default()).await?;
-    set_archived_on(&mut tx, &locked, false).await?;
+    set_archived_on(&mut locked, false).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1161,12 +1175,9 @@ pub async fn unarchive_channel(
 /// Archives (`archive = true`) or restores the channel on `tx`. Refuses with
 /// `AccessDenied` when the channel is already in that state. Restoring an
 /// ephemeral channel restarts its TTL deadline.
-async fn set_archived_on(
-    tx: &mut crate::AdmittedTx,
-    locked: &ChannelSettingsLock,
-    archive: bool,
-) -> Result<()> {
-    let channel_id = locked.channel_id;
+async fn set_archived_on(w: &mut ChannelSettingsWriter<'_>, archive: bool) -> Result<()> {
+    let channel_id = w.channel_id;
+    let tx = &mut *w.tx;
     let community_id = tx.community();
     let row = sqlx::query(
         "SELECT archived_at FROM channels WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
@@ -1254,13 +1265,17 @@ pub(crate) async fn apply_channel_metadata_event(
 
     // The row lock also orders two copies of the same event: the second
     // waits, then sees the first stored.
-    let locked = lock_channel_for_settings_write(&mut tx, channel_id, &edit.columns).await?;
+    let mut locked = lock_channel_for_settings_write(&mut tx, channel_id, &edit.columns).await?;
     let previous_visibility = locked.previous_visibility().to_owned();
 
     // The same writes as `Db::insert_event_with_thread_metadata`.
-    let (stored, inserted) =
-        crate::event::insert_event_with_thread_metadata_tx(&mut tx, event, Some(channel_id), None)
-            .await?;
+    let (stored, inserted) = crate::event::insert_event_with_thread_metadata_tx(
+        locked.tx(),
+        event,
+        Some(channel_id),
+        None,
+    )
+    .await?;
     if !inserted {
         tx.rollback().await?;
         return Ok(ChannelMetadataWrite {
@@ -1269,7 +1284,18 @@ pub(crate) async fn apply_channel_metadata_event(
             previous_visibility,
         });
     }
-    crate::insert_mentions_in_transaction(&mut tx, event, Some(channel_id)).await?;
+    // Decide the archive state here, after the duplicate check and under
+    // the row lock, not during validation. A resend that races the first
+    // commit then sees that commit as a duplicate (above), never as a
+    // channel already in the requested state.
+    match (locked.archived(), edit.archived) {
+        (true, Some(false)) | (false, None | Some(true)) => {}
+        (true, _) => return Err(DbError::AccessDenied("channel is archived".to_string())),
+        (false, Some(false)) => {
+            return Err(DbError::AccessDenied("channel is not archived".to_string()));
+        }
+    }
+    crate::insert_mentions_in_transaction(locked.tx(), event, Some(channel_id)).await?;
 
     let ChannelMetadataEdit {
         columns,
@@ -1279,23 +1305,24 @@ pub(crate) async fn apply_channel_metadata_event(
     } = edit;
     let actor = event.pubkey.to_bytes();
     if !columns.is_empty() {
-        update_channel_on(&mut tx, &locked, columns).await?;
+        update_channel_on(&mut locked, columns).await?;
     }
     if let Some(topic) = topic {
-        set_topic_on(&mut tx, &locked, &topic, &actor).await?;
+        set_topic_on(&mut locked, &topic, &actor).await?;
     }
     if let Some(purpose) = purpose {
-        set_purpose_on(&mut tx, &locked, &purpose, &actor).await?;
+        set_purpose_on(&mut locked, &purpose, &actor).await?;
     }
     if let Some(archive) = archived {
-        set_archived_on(&mut tx, &locked, archive).await?;
+        set_archived_on(&mut locked, archive).await?;
     }
     // The same writes as `Db::insert_event`.
     for message in system_messages {
         let (_, message_inserted) =
-            crate::event::insert_event_in_transaction(&mut tx, message, Some(channel_id)).await?;
+            crate::event::insert_event_in_transaction(locked.tx(), message, Some(channel_id))
+                .await?;
         if message_inserted {
-            crate::insert_mentions_in_transaction(&mut tx, message, Some(channel_id)).await?;
+            crate::insert_mentions_in_transaction(locked.tx(), message, Some(channel_id)).await?;
         }
     }
     tx.commit().await?;

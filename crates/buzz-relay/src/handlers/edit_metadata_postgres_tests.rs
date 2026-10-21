@@ -251,9 +251,10 @@ async fn unarchive_of_an_active_channel_is_refused() {
 
 /// Resending a committed archive or unarchive is a duplicate, not a refusal.
 /// After the first send commits, the channel is already in the requested
-/// state, so validation alone would refuse the identical resend (a lost
-/// response would look like a failure). Mutation: drop the pre-validation
-/// duplicate check in ingest → RED ("channel is not archived").
+/// state, so an archive-state check before the duplicate check would refuse
+/// the identical resend (a lost response would look like a failure).
+/// Mutation: check the archive state before the duplicate check in the
+/// atomic write → RED ("channel is not archived").
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn resent_archive_and_unarchive_are_duplicates() {
@@ -347,4 +348,162 @@ async fn join_role_edit_is_applied_and_announced() {
         .filter_map(|stored| serde_json::from_str::<serde_json::Value>(&stored.event.content).ok())
         .any(|content| content["type"] == "join_role_changed" && content["join_role"] == "guest");
     assert!(announced, "one join_role_changed system message");
+}
+
+/// Sign a kind:9002 that sets `archived` to `value` on `channel_id`.
+fn archive_event(owner: &Keys, channel_id: Uuid, value: &str) -> nostr::Event {
+    EventBuilder::new(Kind::Custom(9002), "")
+        .tags([
+            Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+            Tag::parse(["archived", value]).unwrap(),
+        ])
+        .sign_with_keys(owner)
+        .expect("sign 9002")
+}
+
+/// A resend that passed validation before the first send committed is a
+/// duplicate. This is the interleaving where the resend reads the channel
+/// before the first commit, and reaches the write after it: validation must
+/// not refuse it on the archive state, and the write must report it as a
+/// duplicate. The test runs validation and the write as two steps around
+/// the first commit. Before, validation read the archive state and refused
+/// the resend ("channel is not archived"), even though its first copy had
+/// committed. Mutation: refuse a restore of an active channel during
+/// validation → RED.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn resend_validated_before_the_first_commit_is_a_duplicate() {
+    let state = state().await;
+    let tenant = community(&state, "edit-atomic-resend-window").await;
+    let owner = Keys::generate();
+    let channel_id = create_channel(&state, &tenant, &owner, &[]).await;
+
+    for value in ["true", "false"] {
+        let event = archive_event(&owner, channel_id, value);
+        let first = ingest_event(&state, &tenant, event.clone(), http_auth(&owner))
+            .await
+            .expect("first send");
+        assert!(
+            first.accepted && first.message.is_empty(),
+            "{:?}",
+            first.message
+        );
+        let notices = count_kind(&state, &tenant, channel_id, 40099).await;
+
+        crate::handlers::side_effects::validate_admin_event(&tenant, 9002, &event, &state)
+            .await
+            .unwrap_or_else(|e| panic!("archived={value}: resend refused in validation: {e}"));
+        let (_, inserted) =
+            crate::handlers::side_effects::persist_edit_metadata(&tenant, &event, &state)
+                .await
+                .expect("resend write");
+        assert!(
+            !inserted,
+            "archived={value}: the resend changed the channel"
+        );
+        assert_eq!(
+            count_kind(&state, &tenant, channel_id, 40099).await,
+            notices,
+            "archived={value}: the resend added a notice"
+        );
+    }
+    assert_eq!(count_kind(&state, &tenant, channel_id, 9002).await, 2);
+}
+
+/// Two copies of one restore, sent at the same time, change the channel
+/// once. Both are held at the channel's TTL lock until both wait there, so
+/// both pass validation before either commits. One applies the restore; the
+/// other is reported as a duplicate, with no second notice. The window
+/// where a copy validates after the other commits is covered by
+/// `resend_validated_before_the_first_commit_is_a_duplicate`.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn concurrent_copies_of_a_restore_apply_once() {
+    let pool = sqlx::PgPool::connect(&crate::test_support::database_url())
+        .await
+        .expect("connect test pool");
+    let state = crate::state::tests::test_state_with_database_pool(pool.clone()).await;
+    let tenant = community(&state, "edit-atomic-restore-race").await;
+    let owner = Keys::generate();
+    let channel_id = create_channel(&state, &tenant, &owner, &[]).await;
+    edit_channel(
+        &state,
+        &tenant,
+        &owner,
+        channel_id,
+        &[&["archived", "true"]],
+    )
+    .await
+    .expect("archive");
+    let notices = count_kind(&state, &tenant, channel_id, 40099).await;
+
+    let lock_key = format!(
+        "buzz_channel_ttl:{}:{channel_id}",
+        tenant.community().as_uuid()
+    );
+    let mut holder = pool.begin().await.expect("begin lock holder");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&lock_key)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the TTL lock");
+
+    let event = archive_event(&owner, channel_id, "false");
+    let tasks: Vec<_> = (0..2)
+        .map(|_| {
+            let state = std::sync::Arc::clone(&state);
+            let tenant = tenant.clone();
+            let event = event.clone();
+            let auth = http_auth(&owner);
+            tokio::spawn(async move { ingest_event(&state, &tenant, event, auth).await })
+        })
+        .collect();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+             AND ((classid::bigint << 32) | objid::bigint) = hashtextextended($1, 0)",
+        )
+        .bind(&lock_key)
+        .fetch_one(&pool)
+        .await
+        .expect("read lock waiters");
+        if waiting == 2 {
+            break;
+        }
+        assert!(
+            tasks.iter().all(|task| !task.is_finished()),
+            "a copy finished without waiting for the lock"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both copies never waited for the TTL lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    holder.commit().await.expect("release the TTL lock");
+
+    let mut messages = Vec::new();
+    for task in tasks {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("a copy returns after the lock is released")
+            .expect("task must not panic")
+            .expect("both copies are accepted");
+        assert!(result.accepted, "{:?}", result.message);
+        messages.push(result.message);
+    }
+    messages.sort();
+    assert_eq!(messages, ["", "duplicate:"]);
+    let channel = state
+        .db
+        .get_channel(tenant.community(), channel_id)
+        .await
+        .expect("channel");
+    assert!(channel.archived_at.is_none());
+    assert_eq!(
+        count_kind(&state, &tenant, channel_id, 40099).await,
+        notices + 1
+    );
 }

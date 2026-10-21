@@ -579,26 +579,18 @@ pub async fn validate_admin_event(
 
     let actor_bytes = event.pubkey.to_bytes().to_vec();
 
-    // Reject mutations on archived channels — except kind:9002 with archived=false
-    // (unarchive), which must be allowed through so the channel can be restored,
-    // and a member leaving by themselves (still subject to the last-owner rule).
+    // Reject mutations on archived channels, except a member leaving by
+    // themselves (still subject to the last-owner rule). kind:9002 is not
+    // checked here: its atomic write decides the archive state under the
+    // channel row lock, after its duplicate check, so a resend that races
+    // the first commit is a duplicate and not a refusal.
     let channel = state
         .db
         .get_channel_for_event_write(tenant.community(), channel_id)
         .await
         .map_err(|_| anyhow::anyhow!("channel not found"))?;
-    let is_unarchive_request = kind == 9002
-        && event.tags.iter().any(|t| {
-            let parts = t.as_slice();
-            parts.len() >= 2 && parts[0] == "archived" && parts[1] == "false"
-        });
-    if channel.archived_at.is_some() && !is_unarchive_request && !is_self_departure(event) {
+    if kind != 9002 && channel.archived_at.is_some() && !is_self_departure(event) {
         return Err(anyhow::anyhow!("channel is archived"));
-    }
-    // Restoring an active channel is refused before storage, so that the
-    // atomic kind:9002 write cannot fail on it after authorization.
-    if channel.archived_at.is_none() && is_unarchive_request {
-        return Err(anyhow::anyhow!("channel is not archived"));
     }
 
     match kind {
