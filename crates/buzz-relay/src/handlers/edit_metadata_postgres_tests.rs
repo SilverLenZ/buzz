@@ -361,18 +361,16 @@ fn archive_event(owner: &Keys, channel_id: Uuid, value: &str) -> nostr::Event {
         .expect("sign 9002")
 }
 
-/// A resend that passed validation before the first send committed is a
-/// duplicate. This is the interleaving where the resend reads the channel
-/// before the first commit, and reaches the write after it: validation must
-/// not refuse it on the archive state, and the write must report it as a
-/// duplicate. The test runs validation and the write as two steps around
-/// the first commit. Before, validation read the archive state and refused
-/// the resend ("channel is not archived"), even though its first copy had
-/// committed. Mutation: refuse a restore of an active channel during
-/// validation → RED.
+/// A resend checked after its first copy committed is a duplicate.
+/// Validation runs on the new archive state and must not refuse the resend;
+/// the write must then report it as a duplicate, with no change and no
+/// notice. This is what a resend sees when it is validated after a racing
+/// first copy commits. Before, validation read the archive state and refused
+/// the resend ("channel is not archived"). Mutation: refuse a restore of an
+/// active channel during validation → RED.
 #[tokio::test]
 #[ignore = "requires Postgres"]
-async fn resend_validated_before_the_first_commit_is_a_duplicate() {
+async fn resend_validated_after_the_first_commit_is_a_duplicate() {
     let state = state().await;
     let tenant = community(&state, "edit-atomic-resend-window").await;
     let owner = Keys::generate();
@@ -413,9 +411,9 @@ async fn resend_validated_before_the_first_commit_is_a_duplicate() {
 /// Two copies of one restore, sent at the same time, change the channel
 /// once. Both are held at the channel's TTL lock until both wait there, so
 /// both pass validation before either commits. One applies the restore; the
-/// other is reported as a duplicate, with no second notice. The window
+/// other is reported as a duplicate, with no second notice. The case
 /// where a copy validates after the other commits is covered by
-/// `resend_validated_before_the_first_commit_is_a_duplicate`.
+/// `resend_validated_after_the_first_commit_is_a_duplicate`.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn concurrent_copies_of_a_restore_apply_once() {
