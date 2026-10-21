@@ -22,7 +22,15 @@
 -- owner record. It is idempotent: a converged database only reads. Rerun it
 -- after an interruption.
 --
+-- Every repair transaction must be READ COMMITTED: under REPEATABLE READ or
+-- SERIALIZABLE the community state read after the lock can come from a
+-- snapshot taken before the lock, and miss a fence committed while the
+-- transaction waited. The script sets READ COMMITTED for this session, and
+-- the repair block refuses to run under any other isolation level.
+--
 -- Expected result: both validation queries at the end return 0.
+
+SET default_transaction_isolation = 'read committed';
 
 \echo 'Rows to change (read only):'
 SELECT count(*) AS rows_to_change
@@ -51,6 +59,11 @@ BEGIN
                OR (cm.role = 'bot'    AND u.agent_owner_pubkey IS NULL))
         ORDER BY cm.community_id, cm.pubkey
     LOOP
+        -- Same rule as lock_community_deletion_shared() in crates/buzz-db.
+        IF current_setting('transaction_isolation') <> 'read committed' THEN
+            RAISE EXCEPTION 'bot role repair requires read committed isolation, got %',
+                current_setting('transaction_isolation');
+        END IF;
         SET LOCAL lock_timeout = '5s';
         PERFORM pg_advisory_xact_lock_shared(community_deletion_lock_key(key.community_id));
         SELECT c.deletion_state = 'active' AND c.deleted_at IS NULL

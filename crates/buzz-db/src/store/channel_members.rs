@@ -3278,19 +3278,90 @@ mod postgres_tests {
     const BOT_ROLE_SCRIPT: &str =
         include_str!("../../../../scripts/maintenance/bot_role_follows_agent_owner.sql");
 
-    /// Run the script's repair block the way psql does: alone, outside any
-    /// transaction, so its per-key COMMIT is allowed.
-    async fn run_bot_role_maintenance_script(pool: &PgPool) {
+    /// The script's repair block, without the session setup before it.
+    fn bot_role_repair_block() -> &'static str {
         let start = BOT_ROLE_SCRIPT.find("DO $$").expect("DO block");
         let end = BOT_ROLE_SCRIPT[start..]
             .find("\n$$;")
             .expect("DO block end")
             + start
             + 4;
-        sqlx::raw_sql(&BOT_ROLE_SCRIPT[start..end])
+        &BOT_ROLE_SCRIPT[start..end]
+    }
+
+    /// Run the script's repair block the way psql does: alone, outside any
+    /// transaction, so its per-key COMMIT is allowed.
+    async fn run_bot_role_maintenance_script(pool: &PgPool) {
+        sqlx::raw_sql(bot_role_repair_block())
             .execute(pool)
             .await
             .expect("maintenance script");
+    }
+
+    /// Under REPEATABLE READ the community state read after the deletion lock
+    /// can come from a snapshot taken before it, and miss a fence committed
+    /// while the script waited. The repair block must refuse to run, on its
+    /// own: a schema without the write-fence trigger has no other guard. The
+    /// error must be the block's own refusal, not the trigger's, and no row
+    /// may change. The community is fenced, so a parallel run of the script
+    /// leaves its row alone too.
+    ///
+    /// Mutation: remove the isolation check from the DO block → the block
+    /// runs (or fails on the trigger's error) → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn bot_role_maintenance_script_refuses_repeatable_read() {
+        let pool = setup_pool().await;
+        let creator = random_pubkey();
+        let owner = random_pubkey();
+        let agent = random_pubkey();
+        let community_id = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_id);
+        for key in [&creator, &owner, &agent] {
+            ensure_user(&pool, community, key)
+                .await
+                .expect("ensure user");
+        }
+        crate::user::set_agent_owner(&pool, community, &agent, &owner)
+            .await
+            .expect("record owner");
+        let channel = open_test_channel(&pool, community_id, &creator).await;
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+             VALUES ($1, $2, $3, 'member')",
+        )
+        .bind(community_id)
+        .bind(channel)
+        .bind(&agent)
+        .execute(&pool)
+        .await
+        .expect("seed old relay row");
+        crate::test_support::set_deletion_state(&pool, community_id, "fenced").await;
+
+        let mut conn = pool.acquire().await.expect("connection");
+        sqlx::raw_sql("SET default_transaction_isolation = 'repeatable read'")
+            .execute(&mut *conn)
+            .await
+            .expect("operator isolation");
+        let err = sqlx::raw_sql(bot_role_repair_block())
+            .execute(&mut *conn)
+            .await
+            .expect_err("the repair block refuses repeatable read");
+        assert!(
+            err.to_string()
+                .contains("bot role repair requires read committed isolation"),
+            "the block's own refusal, got {err}"
+        );
+        sqlx::raw_sql("RESET default_transaction_isolation")
+            .execute(&mut *conn)
+            .await
+            .expect("reset isolation");
+        drop(conn);
+        assert_eq!(
+            stored_role(&pool, community_id, channel, &agent).await,
+            "member",
+            "no row changes"
+        );
     }
 
     /// The script's two validation queries, limited to one community so
