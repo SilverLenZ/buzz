@@ -3383,11 +3383,12 @@ async fn test_nip29_member_raises_guest_agent() {
     .await;
     assert!(accepted, "a member raises a guest agent: {msg}");
     member_client.disconnect().await.ok();
+    // The agent has a recorded owner, so the relay stores `member` as `bot`.
     assert_eq!(
         member_role(&url, &owner, &channel_id, &agent_hex)
             .await
             .as_deref(),
-        Some("member")
+        Some("bot")
     );
     let (accepted, msg) = post_ws(&url, &channel_id, &agent, "agent post").await;
     assert!(accepted, "raised agent post: {msg}");
