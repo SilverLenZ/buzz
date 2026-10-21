@@ -3523,6 +3523,12 @@ async fn ingest_event_inner(
         crate::handlers::side_effects::persist_workflow_deletion(tenant, &event, state)
             .await
             .map_err(|e| IngestError::Internal(format!("error: workflow deletion failed: {e}")))?
+    } else if kind_u32 == KIND_NIP29_EDIT_METADATA {
+        // One commit stores the event and applies its channel changes. A
+        // failure stores nothing, so the client is told and can resend it.
+        crate::handlers::side_effects::persist_edit_metadata(tenant, &event, state)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: channel update failed: {e}")))?
     } else if buzz_core::kind::is_replaceable(kind_u32) {
         // NIP-16 replaceable event — atomic replace with stale-write protection.
         // channel_id is None for global kinds (0, 1, 3) due to step 5b above.
@@ -3614,7 +3620,10 @@ async fn ingest_event_inner(
         });
     }
 
-    if !workflow_deletion && crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
+    // Workflow deletion and kind:9002 applied their changes in the insert's
+    // own transaction above.
+    let persisted_atomically = workflow_deletion || kind_u32 == KIND_NIP29_EDIT_METADATA;
+    if !persisted_atomically && crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
         if let Err(e) =
             crate::handlers::side_effects::handle_side_effects(tenant, kind_u32, &event, state)
                 .await
