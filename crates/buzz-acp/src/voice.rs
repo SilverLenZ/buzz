@@ -14,8 +14,10 @@
 //! decoded, or transcribed still reaches the agent as an ordinary attachment.
 //! A missing speech model must never cost the agent the message.
 
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
+use buzz_voice::MAX_TRANSCRIBE_SECONDS;
 use nostr::Event;
 
 /// The MIME the relay reports for a packaged voice note.
@@ -176,10 +178,14 @@ pub fn transcribe_bytes(bytes: &[u8], config: &TranscriberConfig) -> Option<Stri
         }
     };
     if text.is_empty() {
-        tracing::warn!(
+        // An empty transcript is a NORMAL outcome: the recognizer heard no
+        // speech. `buzz_voice` documents it as such — a silent or non-speech
+        // note. Logging this at WARN would fill the log with warnings for
+        // people who tap record and say nothing.
+        tracing::debug!(
             target: "voice",
             model_dir = %config.model_dir.display(),
-            "the voice note transcribed to empty text; skipping the transcript"
+            "the voice note contained no speech; skipping the transcript"
         );
         None
     } else {
@@ -242,24 +248,51 @@ fn decode_voice_note(bytes: &[u8]) -> Option<(Vec<f32>, u32)> {
     const SAMPLE_RATE: u32 = 16_000;
 
     // `ffmpeg` reads from a path, so the bytes have to land on disk first.
+    //
+    // The file holds a private voice note, so it is created with owner-only
+    // permissions rather than the default umask-derived ones. `create_new`
+    // makes the creation exclusive, so the name cannot be pre-planted.
     let temp_path = std::env::temp_dir().join(format!(
         "buzz-voice-note-{}-{}.mp4",
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     ));
-    if let Err(error) = std::fs::write(&temp_path, bytes) {
+    let write_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp_path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, bytes));
+    if let Err(error) = write_result {
         tracing::warn!(
             target: "voice",
             path = %temp_path.display(),
             error = %error,
             "could not stage the voice note for decoding; skipping transcription"
         );
+        let _ = std::fs::remove_file(&temp_path);
         return None;
     }
 
+    // `-t` bounds the decode. Without it ffmpeg decodes the WHOLE file into
+    // `output.stdout` before `buzz_voice::transcribe` applies
+    // `MAX_TRANSCRIBE_SECONDS` — so a long audio track is fully materialised
+    // in memory before the cap rejects it. The relay's media validation caps
+    // the VIDEO track's duration but not the audio track's, so an ordinary
+    // inbound attachment can carry hours of AAC. The recognizer's cap stays
+    // as defence in depth; this bounds the memory the decode itself costs.
+    //
+    // The bound is one second PAST the cap, not at it: ffmpeg's `-t` is
+    // inclusive, so `-t 120` on a long file yields exactly the cap's worth of
+    // samples and the recognizer's `samples.len() > max_samples` check would
+    // no longer fire — an over-long note would silently transcribe as empty
+    // instead of being rejected. Decoding one second past the cap keeps the
+    // rejection intact while still bounding the buffer to ~7.7 MB.
+    let decode_limit = MAX_TRANSCRIBE_SECONDS + 1.0;
     let output = std::process::Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
         .arg(&temp_path)
+        .args(["-t", &decode_limit.to_string()])
         .args(["-f", "f32le", "-ar"])
         .arg(SAMPLE_RATE.to_string())
         .args(["-ac", "1", "pipe:1"])
@@ -450,9 +483,16 @@ mod tests {
 
         let logged = String::from_utf8(captured.0.lock().expect("capture poisoned").clone())
             .expect("captured log must be utf-8");
+        // Two different failures reach this point depending on the box:
+        // a missing `ffmpeg` binary fails earlier ("could not run ffmpeg"),
+        // and a present ffmpeg that cannot decode the bytes fails here
+        // ("did not produce usable audio"). Either satisfies the property
+        // this test protects — the failure is LOGGED, not swallowed — so
+        // accept both.
         assert!(
-            logged.contains("ffmpeg did not produce usable audio"),
-            "a failed decode must be logged, got: {logged}"
+            logged.contains("could not run ffmpeg to decode the voice note")
+                || logged.contains("ffmpeg did not produce usable audio"),
+            "a decode failure must be logged, got: {logged}"
         );
     }
 

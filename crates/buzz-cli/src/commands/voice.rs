@@ -11,6 +11,8 @@
 
 use std::path::PathBuf;
 
+use buzz_voice::MAX_TRANSCRIBE_SECONDS;
+
 use crate::error::CliError;
 
 /// Dispatch `buzz voice ...`.
@@ -92,14 +94,32 @@ fn is_wav(path: &std::path::Path) -> bool {
 ///
 /// `ffmpeg` is the only tool that reads the AAC track out of a Buzz voice
 /// note's MP4 container, and it is already a dependency of the media pipeline.
+///
+/// The decode is bounded by `MAX_TRANSCRIBE_SECONDS` via `-t`. Without it,
+/// ffmpeg decodes the whole file into `output.stdout` and the recognizer's
+/// cap only rejects it afterwards — so the memory cost scales with the
+/// input, not with the cap.
 fn decode_with_ffmpeg(path: &std::path::Path) -> Result<(Vec<f32>, u32), CliError> {
     const SAMPLE_RATE: u32 = 16_000;
 
     let display = path.display().to_string();
+    // `-t` bounds the decode. Without it, ffmpeg decodes the whole file into
+    // `output.stdout` and the recognizer's cap only rejects it afterwards —
+    // so the memory cost scales with the input, not with the cap.
+    //
+    // The bound is one second PAST the cap, not at it: ffmpeg's `-t` is
+    // inclusive, so `-t 120` on a 900-second file yields exactly the cap's
+    // worth of samples, and the recognizer's `samples.len() > max_samples`
+    // check would no longer fire — an over-long file would silently
+    // transcribe as an empty note instead of being rejected. Decoding one
+    // second past the cap keeps the rejection intact while still bounding
+    // the buffer to ~7.7 MB.
+    let decode_limit = MAX_TRANSCRIBE_SECONDS + 1.0;
     let output = std::process::Command::new("ffmpeg")
         .args(["-v", "error"])
         .arg("-i")
         .arg(path)
+        .args(["-t", &decode_limit.to_string()])
         .args(["-f", "f32le", "-ar"])
         .arg(SAMPLE_RATE.to_string())
         .args(["-ac", "1"])
@@ -170,5 +190,61 @@ mod tests {
         std::fs::write(&path, bytes).expect("write fixture");
         assert!(is_wav(&path));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The ffmpeg decode must be BOUNDED by `MAX_TRANSCRIBE_SECONDS`.
+    ///
+    /// Without `-t`, ffmpeg decodes the whole input into `output.stdout`
+    /// before the recognizer's cap rejects it — so the memory cost scales
+    /// with the input rather than with the cap. The relay's media validation
+    /// caps the video track's duration but not the audio track's, so an
+    /// ordinary inbound attachment can carry hours of AAC.
+    ///
+    /// This asserts the bound on the real decoder: a file longer than the cap
+    /// must decode to no more than the cap's worth of samples.
+    #[test]
+    fn the_ffmpeg_decode_is_bounded_by_the_transcribe_cap() {
+        // A file with more than the cap's worth of audio. A 16-bit mono
+        // 16 kHz WAV of silence is cheap to synthesize and unambiguous.
+        let sample_rate = 16_000u32;
+        let seconds = MAX_TRANSCRIBE_SECONDS as usize + 10;
+        let samples = (sample_rate as usize) * seconds;
+        let mut pcm = Vec::with_capacity(samples * 2);
+        for _ in 0..samples {
+            pcm.extend_from_slice(&0i16.to_le_bytes());
+        }
+
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&pcm);
+
+        let path = std::env::temp_dir().join("buzz-cli-voice-too-long.wav");
+        std::fs::write(&path, &bytes).expect("write fixture");
+
+        // The WAV path is NOT ffmpeg's, so drive the ffmpeg decoder directly
+        // to exercise the bound that matters.
+        let result = decode_with_ffmpeg(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let (decoded, rate) = result.expect("ffmpeg must decode the fixture");
+        assert_eq!(rate, 16_000);
+        // The decode is bounded to the cap plus the one second of headroom
+        // that keeps the recognizer's own rejection intact.
+        let max_samples = ((MAX_TRANSCRIBE_SECONDS + 1.0) * 16_000.0) as usize;
+        assert!(
+            decoded.len() <= max_samples,
+            "the decode must be bounded to {max_samples} samples, got {}",
+            decoded.len()
+        );
     }
 }
