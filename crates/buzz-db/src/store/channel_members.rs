@@ -199,13 +199,13 @@ pub(crate) async fn acquire_channel_membership_lock(
 
 /// Check the same p-tag shape and canonical active membership as migration 0032.
 /// The caller holds this channel's membership advisory lock on the admitted
-/// transaction before calling. The membership writers in this module take that
-/// key before reading roles or changing rows. Not every writer does yet:
-/// `execute_kick_with_marker` and `deploy_kick_member` (relay_admin_actions.rs)
-/// set `removed_at` without it, so a kick can commit after this check passes
-/// and before the roster commits. The retained trigger has the same gap. Both
-/// kick paths must take the key, with a concurrent kick-vs-roster-publication
-/// test, before anything relies on complete serialization (phase 2 included).
+/// transaction before calling. Every writer that changes the membership of an
+/// existing channel takes that key before reading roles or changing rows
+/// (channel creation inserts rows that no other transaction can see yet),
+/// including both kick paths
+/// (`execute_kick_with_marker` and `deploy_kick_member` in
+/// relay_admin_actions.rs), so no removal can commit between this check and
+/// the roster commit.
 /// Legacy replacement takes the replacement key, locks
 /// old-head rows in its UPDATE, then takes the membership key at trigger INSERT.
 /// The app path takes replacement key -> membership key -> old-head row locks,
@@ -287,17 +287,89 @@ pub(crate) async fn guard_channel_roster_event(
 
 // ── Transaction-level membership helpers (for commit_participant_join) ────────
 
-/// Acquire the per-channel membership advisory lock on a caller-owned transaction.
+/// Proof that a caller-owned transaction holds the membership locks of a set
+/// of channels. Only [`lock_channel_memberships_in_transaction`] makes one,
+/// after it takes the locks on the transaction it borrows. The borrow binds
+/// the locks to that transaction: the proof cannot be used with another
+/// transaction or after its commit. Membership writes that compose with other
+/// work on the caller's transaction (a huddle join) are methods on it, so
+/// they cannot run without the lock.
+pub struct ChannelMembershipLocks<'tx> {
+    tx: &'tx mut AdmittedTx,
+    channels: Vec<Uuid>,
+}
+
+impl ChannelMembershipLocks<'_> {
+    /// The locked transaction, for the other reads and writes of the caller's
+    /// operation.
+    pub fn tx(&mut self) -> &mut AdmittedTx {
+        self.tx
+    }
+
+    fn check_covers(&self, channel_id: Uuid) -> Result<()> {
+        if self.channels.contains(&channel_id) {
+            Ok(())
+        } else {
+            Err(DbError::InvalidData(
+                "channel membership write is not covered by its lock".into(),
+            ))
+        }
+    }
+
+    /// Auto-add a member (for ephemeral-channel admission).
+    ///
+    /// Inserts or reactivates the membership row at `Member` role with the
+    /// given `invited_by` (channel creator for huddle auto-add). Refuses a
+    /// channel whose membership lock this proof does not hold.
+    ///
+    /// Used by `commit_participant_join` to atomically add membership and the
+    /// `48101` event in a single transaction under a session effect permit.
+    pub async fn insert_auto_membership(
+        &mut self,
+        channel_id: Uuid,
+        pubkey: &[u8],
+        invited_by: &[u8],
+    ) -> Result<()> {
+        self.check_covers(channel_id)?;
+        let community_id = self.tx.community();
+        sqlx::query(
+            r#"
+            INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by)
+            VALUES ($1, $2, $3, 'member'::member_role, $4)
+            ON CONFLICT (community_id, channel_id, pubkey) DO UPDATE SET
+                removed_at = NULL,
+                removed_by = NULL,
+                role = EXCLUDED.role
+            "#,
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .bind(pubkey)
+        .bind(invited_by)
+        .execute(self.tx.conn())
+        .await?;
+        Ok(())
+    }
+}
+
+/// Take the membership lock of each channel in `channels`, in that order, on
+/// a caller-owned transaction, and return the proof that holds them.
 ///
-/// Equivalent to the internal `acquire_channel_membership_lock`, but exposed
-/// for callers that need to compose multiple operations in one transaction
-/// (e.g., `commit_participant_join` in `audio/handler.rs`).
-pub async fn acquire_channel_membership_lock_in_transaction(
-    tx: &mut AdmittedTx,
-    channel_id: Uuid,
-) -> Result<()> {
+/// These locks come first in the channel lock order (membership, then TTL,
+/// then the channel row; see `channel::lock_channel_for_settings_write`).
+/// Take them before any other channel lock on `tx`.
+pub async fn lock_channel_memberships_in_transaction<'tx>(
+    tx: &'tx mut AdmittedTx,
+    channels: &[Uuid],
+) -> Result<ChannelMembershipLocks<'tx>> {
     let community_id = tx.community();
-    acquire_channel_membership_lock(tx.conn(), community_id, channel_id).await
+    for channel_id in channels {
+        acquire_channel_membership_lock(tx.conn(), community_id, *channel_id).await?;
+    }
+    Ok(ChannelMembershipLocks {
+        tx,
+        channels: channels.to_vec(),
+    })
 }
 
 /// Lock the live channel row on a caller-owned transaction and return its
@@ -403,41 +475,6 @@ pub async fn active_role_in_transaction(
 ) -> Result<Option<String>> {
     let community_id = tx.community();
     get_active_role_tx(tx.conn(), community_id, channel_id, pubkey).await
-}
-
-/// Auto-add a member on a caller-owned transaction (for ephemeral-channel admission).
-///
-/// Inserts or reactivates the membership row at `Member` role with the given
-/// `invited_by` (channel creator for huddle auto-add). Does NOT acquire the
-/// advisory lock — callers must have already called
-/// `acquire_channel_membership_lock_in_transaction` before calling this.
-///
-/// Used by `commit_participant_join` to atomically add membership and the
-/// `48101` event in a single transaction under a session effect permit.
-pub async fn insert_auto_membership_in_transaction(
-    tx: &mut AdmittedTx,
-    channel_id: Uuid,
-    pubkey: &[u8],
-    invited_by: &[u8],
-) -> Result<()> {
-    let community_id = tx.community();
-    sqlx::query(
-        r#"
-        INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by)
-        VALUES ($1, $2, $3, 'member'::member_role, $4)
-        ON CONFLICT (community_id, channel_id, pubkey) DO UPDATE SET
-            removed_at = NULL,
-            removed_by = NULL,
-            role = EXCLUDED.role
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(channel_id)
-    .bind(pubkey)
-    .bind(invited_by)
-    .execute(tx.conn())
-    .await?;
-    Ok(())
 }
 
 // ── End transaction-level helpers ─────────────────────────────────────────────
