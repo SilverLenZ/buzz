@@ -918,8 +918,33 @@ pub(crate) async fn lock_channel_for_settings_write<'tx>(
     channel_id: Uuid,
     updates: &ChannelUpdate,
 ) -> Result<ChannelSettingsWriter<'tx>> {
+    let ttl = if updates.ttl_seconds.is_some() {
+        TtlLock::Exclusive
+    } else {
+        TtlLock::Shared
+    };
+    lock_channel_row(tx, channel_id, updates.changes_admission(), ttl).await
+}
+
+/// Takes the locks that deleting `channel_id` needs, in the same order as
+/// [`lock_channel_for_settings_write`]. A delete ends admission, so it takes
+/// the membership lock: a membership write or a huddle join either commits
+/// first or, under the lock, finds the channel deleted. A delete does not
+/// change the TTL, so the TTL lock is SHARED.
+async fn lock_channel_for_delete(
+    tx: &mut crate::AdmittedTx,
+    channel_id: Uuid,
+) -> Result<ChannelSettingsWriter<'_>> {
+    lock_channel_row(tx, channel_id, true, TtlLock::Shared).await
+}
+
+async fn lock_channel_row(
+    tx: &mut crate::AdmittedTx,
+    channel_id: Uuid,
+    admission: bool,
+    ttl: TtlLock,
+) -> Result<ChannelSettingsWriter<'_>> {
     let community_id = tx.community();
-    let admission = updates.changes_admission();
     if admission {
         crate::channel_members::acquire_channel_membership_lock(
             tx.conn(),
@@ -928,11 +953,6 @@ pub(crate) async fn lock_channel_for_settings_write<'tx>(
         )
         .await?;
     }
-    let ttl = if updates.ttl_seconds.is_some() {
-        TtlLock::Exclusive
-    } else {
-        TtlLock::Shared
-    };
     lock_channel_ttl(tx, channel_id, ttl).await?;
     // `FOR NO KEY UPDATE`, like a huddle join: it orders this write against
     // every other settings write and a huddle join, but not against the
@@ -1348,16 +1368,30 @@ pub async fn soft_delete_channel(
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    let result = sqlx::query(
-        "UPDATE channels SET deleted_at = NOW() WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
-    )
-            .bind(community_id.as_uuid())
-            .bind(channel_id)
-            .execute(tx.conn())
-            .await?;
-
+    let mut writer = match lock_channel_for_delete(&mut tx, channel_id).await {
+        Ok(writer) => writer,
+        Err(DbError::ChannelNotFound(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    soft_delete_on(&mut writer).await?;
     tx.commit().await?;
-    Ok(result.rows_affected() > 0)
+    Ok(true)
+}
+
+async fn soft_delete_on(w: &mut ChannelSettingsWriter<'_>) -> Result<()> {
+    if !w.admission {
+        return Err(DbError::InvalidData(
+            "channel delete is not covered by its lock".into(),
+        ));
+    }
+    let channel_id = w.channel_id;
+    let community_id = w.tx.community();
+    sqlx::query("UPDATE channels SET deleted_at = NOW() WHERE community_id = $1 AND id = $2")
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .execute(w.tx.conn())
+        .await?;
+    Ok(())
 }
 
 /// Archive ephemeral channels whose TTL deadline has passed.
@@ -1390,6 +1424,16 @@ pub async fn reap_expired_ephemeral_channels(pool: &PgPool) -> Result<Vec<Reaped
         crate::observability::WriterOperation::Maintenance,
         "ephemeral_channel_reap",
         |id, mut tx| async move {
+            // This archive takes no advisory lock, unlike
+            // `lock_channel_for_settings_write`. It does not need one: it is
+            // a single UPDATE whose WHERE clause holds every condition for
+            // the archive. The UPDATE waits for the row lock of any writer
+            // that holds the row (a TTL refresh, a settings write, a huddle
+            // join). Under READ COMMITTED, PostgreSQL then checks the WHERE
+            // clause again against the version that writer committed. So a
+            // refresh that moved the deadline wins, a channel archived or
+            // deleted meanwhile is skipped, and a join that held the row
+            // commits first. Do not split this into a read and a write.
             let rows = sqlx::query(
                 "UPDATE channels AS ch SET archived_at = NOW() \
                  FROM communities AS c \
@@ -2359,5 +2403,53 @@ mod postgres_tests {
             .await
             .expect("members");
         assert_eq!(members.len(), 1, "only the first creator is a member");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn soft_delete_waits_for_membership_lock() {
+        let pool = setup_pool().await;
+        let community_id = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_id);
+        let owner = random_pubkey();
+        let channel = create_test_channel(
+            &pool,
+            community_id,
+            "delete-vs-roster",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .expect("create channel");
+
+        // A roster publication holds the membership lock. A delete ends
+        // admission, so it must wait, like any membership write.
+        let snapshot =
+            crate::channel_members::lock_member_snapshot(&pool, community, channel.id, &[9u8; 32])
+                .await
+                .expect("capture locked roster");
+        let delete_pool = crate::test_support::named_pool("delete-vs-roster").await;
+        let channel_id = channel.id;
+        let delete =
+            tokio::spawn(
+                async move { soft_delete_channel(&delete_pool, community, channel_id).await },
+            );
+        crate::test_support::wait_for_lock_wait(&pool, "delete-vs-roster").await;
+        assert!(
+            !delete.is_finished(),
+            "delete must wait for the roster fence"
+        );
+        snapshot.release().await.expect("release roster fence");
+        assert!(delete.await.expect("delete task").expect("delete"));
+
+        assert!(
+            !soft_delete_channel(&pool, community, channel.id)
+                .await
+                .expect("second delete"),
+            "a second delete finds no live channel"
+        );
     }
 }
