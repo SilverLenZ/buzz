@@ -1956,8 +1956,11 @@ pub enum VoiceModelType {
     Paraformer,
     /// Zipformer transducer.
     Transducer,
-    /// NeMo Parakeet TDT.
+    /// NeMo Parakeet TDT (encoder/decoder/joiner triple).
     Parakeet,
+    /// NeMo Parakeet TDT-CTC (single model file) — the layout the Buzz desktop
+    /// ships as `parakeet-tdt-ctc-110m-en`.
+    ParakeetCtc,
 }
 
 impl VoiceModelType {
@@ -1968,6 +1971,7 @@ impl VoiceModelType {
             Self::Paraformer => buzz_voice::ModelType::Paraformer,
             Self::Transducer => buzz_voice::ModelType::Transducer,
             Self::Parakeet => buzz_voice::ModelType::Parakeet,
+            Self::ParakeetCtc => buzz_voice::ModelType::ParakeetCtc,
         }
     }
 }

@@ -86,6 +86,16 @@ impl TranscribeConfig {
             lm: None,
         }
     }
+
+    /// Configure a NeMo Parakeet TDT-CTC model directory (single
+    /// `model*.onnx` + `tokens.txt`).
+    pub fn parakeet_ctc(model_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            model_dir: model_dir.into(),
+            model_type: ModelType::ParakeetCtc,
+            lm: None,
+        }
+    }
 }
 
 /// The `sherpa-onnx` model family a [`TranscribeConfig`] points at.
@@ -110,6 +120,18 @@ pub enum ModelType {
     /// [`ModelType::Transducer`]; it differs in the `model_type` string the
     /// sherpa-onnx runtime is given.
     Parakeet,
+    /// NeMo Parakeet TDT-CTC. The model directory holds a single `model*.onnx`
+    /// (the CTC head) and `tokens.txt`.
+    ///
+    /// This is the layout the Buzz desktop ships: the
+    /// `sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8` release has one
+    /// ONNX file, not the encoder/decoder/joiner triple that
+    /// [`ModelType::Parakeet`] needs. Pointing a TDT model type at it fails at
+    /// model resolution.
+    ///
+    /// CTC blank-token decoding also removes the silence/cut-audio
+    /// hallucination class that hurts encoder-decoder models on short notes.
+    ParakeetCtc,
 }
 
 impl ModelType {
@@ -120,6 +142,7 @@ impl ModelType {
             Self::Paraformer => "paraformer",
             Self::Transducer => "nemo_transducer",
             Self::Parakeet => "nemo_parakeet_tdt",
+            Self::ParakeetCtc => "nemo_ctc",
         }
     }
 }
@@ -246,6 +269,11 @@ fn build_recognizer(config: &TranscribeConfig) -> Result<OfflineRecognizer, Tran
                 ..Default::default()
             };
         }
+        ModelType::ParakeetCtc => {
+            model_config.nemo_ctc = sherpa_onnx::OfflineNemoEncDecCtcModelConfig {
+                model: Some(resolve_file(dir, "model.onnx")?),
+            };
+        }
     }
 
     let mut recognizer_config = OfflineRecognizerConfig::default();
@@ -368,6 +396,7 @@ mod tests {
         assert_eq!(ModelType::Paraformer.as_str(), "paraformer");
         assert_eq!(ModelType::Transducer.as_str(), "nemo_transducer");
         assert_eq!(ModelType::Parakeet.as_str(), "nemo_parakeet_tdt");
+        assert_eq!(ModelType::ParakeetCtc.as_str(), "nemo_ctc");
     }
 
     #[test]

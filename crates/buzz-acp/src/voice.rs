@@ -118,13 +118,18 @@ impl TranscriberConfig {
             "paraformer" => buzz_voice::ModelType::Paraformer,
             "transducer" | "zipformer" => buzz_voice::ModelType::Transducer,
             "whisper" => buzz_voice::ModelType::Whisper,
-            // Parakeet is the default: measured on the same labeled clips it
-            // beats whisper base.en on WER (0.1380 vs 0.1618) and handles
-            // acronyms better ("TTS" -> "T S" rather than "PTSD"). It costs
-            // 3x the latency, which is acceptable for a voice note a person
-            // deliberately sent. Set BUZZ_VOICE_MODEL_TYPE=whisper for the
-            // faster, smaller model.
-            _ => buzz_voice::ModelType::Parakeet,
+            // Parakeet TDT-CTC is the default: it is the layout the Buzz
+            // desktop ships (`parakeet-tdt-ctc-110m-en`, a single `model.int8.onnx`
+            // + `tokens.txt`), so the same model directory works on both sides
+            // without a second download. It also decodes with CTC blank tokens,
+            // which removes the silence/cut-audio hallucination class that hurts
+            // encoder-decoder models on short notes.
+            //
+            // The older TDT triple (encoder/decoder/joiner) is still selectable
+            // as "parakeet" for a 0.6b release; it is not the default because
+            // it cannot load the 110M CTC model.
+            "parakeet" | "parakeet_tdt" => buzz_voice::ModelType::Parakeet,
+            _ => buzz_voice::ModelType::ParakeetCtc,
         };
 
         Some(Self {
@@ -297,6 +302,9 @@ mod tests {
             ("transducer", buzz_voice::ModelType::Transducer),
             ("zipformer", buzz_voice::ModelType::Transducer),
             ("parakeet", buzz_voice::ModelType::Parakeet),
+            ("parakeet_tdt", buzz_voice::ModelType::Parakeet),
+            ("parakeet_ctc", buzz_voice::ModelType::ParakeetCtc),
+            ("ctc", buzz_voice::ModelType::ParakeetCtc),
         ] {
             std::env::set_var("BUZZ_VOICE_MODEL_TYPE", name);
             let config = TranscriberConfig::from_env().expect("model dir is set");
@@ -306,7 +314,7 @@ mod tests {
         // Unset means the measured default.
         std::env::remove_var("BUZZ_VOICE_MODEL_TYPE");
         let config = TranscriberConfig::from_env().expect("model dir is set");
-        assert_eq!(config.model_type, buzz_voice::ModelType::Parakeet);
+        assert_eq!(config.model_type, buzz_voice::ModelType::ParakeetCtc);
 
         if let Some(value) = previous_dir {
             std::env::set_var("BUZZ_VOICE_MODEL_DIR", value);
