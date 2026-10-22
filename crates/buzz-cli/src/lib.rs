@@ -1987,7 +1987,12 @@ pub enum VoiceCmd {
         #[arg(long)]
         model_dir: Option<PathBuf>,
         /// Speech model family
-        #[arg(long, value_enum, default_value = "whisper")]
+        ///
+        /// Defaults to `parakeet-ctc`: the layout the Buzz desktop ships as
+        /// `parakeet-tdt-ctc-110m-en` (a single `model.int8.onnx` plus
+        /// `tokens.txt`), so the same model directory works for the CLI and
+        /// the ACP harness without a second download.
+        #[arg(long, value_enum, default_value = "parakeet-ctc")]
         model_type: VoiceModelType,
     },
 }
@@ -2307,6 +2312,40 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// The CLI's default speech model family must match the ACP harness's
+    /// default.
+    ///
+    /// The Buzz desktop ships `parakeet-tdt-ctc-110m-en`: a single
+    /// `model.int8.onnx` plus `tokens.txt`. If the CLI defaults to a
+    /// different family than the harness, the same model directory silently
+    /// works in one place and fails in the other with
+    /// "encoder.onnx is missing". Both defaults are pinned to the CTC layout
+    /// the desktop ships.
+    #[test]
+    fn the_cli_default_model_family_is_the_ctc_layout_the_desktop_ships() {
+        let mut command = Cli::command();
+        let voice = command
+            .get_subcommands_mut()
+            .find(|sub| sub.get_name() == "voice")
+            .expect("the voice command must exist");
+        let subcommand = voice
+            .get_subcommands_mut()
+            .find(|s| s.get_name() == "transcribe")
+            .expect("the voice transcribe command must exist");
+
+        let default = subcommand
+            .get_arguments()
+            .find(|arg| arg.get_id() == "model_type")
+            .and_then(|arg| arg.get_default_values().first())
+            .and_then(|value| value.to_str())
+            .expect("model_type must have a default");
+
+        assert_eq!(
+            default, "parakeet-ctc",
+            "the CLI default must be the CTC layout the Buzz desktop ships"
+        );
+    }
 
     /// Raw shorthand `[auth,hex,,hex]` normalizes to strict JSON; the empty
     /// conditions field becomes `""`.
