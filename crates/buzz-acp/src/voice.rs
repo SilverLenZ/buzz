@@ -14,7 +14,6 @@
 //! decoded, or transcribed still reaches the agent as an ordinary attachment.
 //! A missing speech model must never cost the agent the message.
 
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use buzz_voice::MAX_TRANSCRIBE_SECONDS;
@@ -233,6 +232,33 @@ pub async fn resolve_transcript(
     transcribe_bytes(&bytes, &config)
 }
 
+/// Stage `bytes` at `path` with 0600 permissions set at creation time, so
+/// there is no window where the note is world-readable.
+///
+/// `create_new` makes the creation exclusive, so the name cannot be
+/// pre-planted by another process.
+///
+/// Non-Unix: a plain write. The workspace's `windows-rust` CI job compiles
+/// this crate for `x86_64-pc-windows-msvc`, and `OpenOptionsExt` does not
+/// exist there — so the unix import must stay inside a gated function rather
+/// than at module scope.
+#[cfg(unix)]
+fn stage_voice_note(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn stage_voice_note(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
 /// Decode the audio track of a canonical Buzz voice note into mono samples.
 ///
 /// The file is a `video/mp4`; `ffmpeg` reads the AAC track out of the
@@ -257,12 +283,7 @@ fn decode_voice_note(bytes: &[u8]) -> Option<(Vec<f32>, u32)> {
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     ));
-    let write_result = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp_path)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, bytes));
+    let write_result = stage_voice_note(&temp_path, bytes);
     if let Err(error) = write_result {
         tracing::warn!(
             target: "voice",
