@@ -83,11 +83,27 @@ fn decode_input(input: &str) -> Result<(Vec<f32>, u32), CliError> {
 }
 
 /// True when `path` is a RIFF/WAVE file.
+///
+/// Reads only the first 12 bytes — the RIFF magic, the chunk size, and the
+/// `WAVE` form type. Reading the whole file to sniff a magic number made a
+/// large input cost a full extra read before the real decode even started.
+///
+/// Note: the WAV branch of [`decode_input`] loads the file through
+/// `sherpa_onnx::Wave::read` with no duration bound, so an over-long WAV is
+/// fully materialised before the recognizer's cap rejects it — the same
+/// shape as the ffmpeg decode bug this branch's sibling had. That path is
+/// local and user-invoked (a person points the CLI at a file on their own
+/// disk), not the remote ingest path, so it is left as-is deliberately.
 fn is_wav(path: &std::path::Path) -> bool {
-    let Ok(bytes) = std::fs::read(path) else {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
-    bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE"
+    let mut header = [0u8; 12];
+    match file.read_exact(&mut header) {
+        Ok(()) => &header[..4] == b"RIFF" && &header[8..12] == b"WAVE",
+        Err(_) => false,
+    }
 }
 
 /// Decode any media file to mono 16-bit PCM via `ffmpeg`.
@@ -189,6 +205,36 @@ mod tests {
         bytes.extend_from_slice(b"WAVE");
         std::fs::write(&path, bytes).expect("write fixture");
         assert!(is_wav(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file too short to hold a WAV header is not a WAV, and must not be
+    /// mistaken for one.
+    ///
+    /// The sniff reads exactly 12 bytes. A file shorter than that must
+    /// return false rather than erroring or reading past the end.
+    #[test]
+    fn a_file_shorter_than_a_wav_header_is_not_a_wav() {
+        for length in 0..12usize {
+            let path = std::env::temp_dir().join(format!("buzz-cli-voice-too-short-{length}.bin"));
+            std::fs::write(&path, vec![0u8; length]).expect("write fixture");
+            assert!(
+                !is_wav(&path),
+                "a {length}-byte file must not be detected as a WAV"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// A file that starts with `RIFF` but is not `WAVE` is not a WAV.
+    #[test]
+    fn a_riff_file_that_is_not_wave_is_not_a_wav() {
+        let path = std::env::temp_dir().join("buzz-cli-voice-is-riff-not-wave.wav");
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(b"AVI ");
+        std::fs::write(&path, bytes).expect("write fixture");
+        assert!(!is_wav(&path));
         let _ = std::fs::remove_file(&path);
     }
 
