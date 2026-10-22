@@ -159,11 +159,28 @@ fn model_type_from_env(raw: &str) -> buzz_voice::ModelType {
 /// `video/mp4` whose audio track carries the speech.
 ///
 /// Returns `None` when the bytes cannot be decoded or the model is missing;
-/// the caller treats that as "no transcript" rather than as an error.
+/// the caller treats that as "no transcript" rather than as an error. Every
+/// failure logs, so a transcript that never appears is diagnosable.
 pub fn transcribe_bytes(bytes: &[u8], config: &TranscriberConfig) -> Option<String> {
     let samples = decode_voice_note(bytes)?;
-    let text = buzz_voice::transcribe(&samples.0, samples.1, &config.voice_config()).ok()?;
+    let text = match buzz_voice::transcribe(&samples.0, samples.1, &config.voice_config()) {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::warn!(
+                target: "voice",
+                model_dir = %config.model_dir.display(),
+                error = %error,
+                "could not transcribe the voice note; skipping the transcript"
+            );
+            return None;
+        }
+    };
     if text.is_empty() {
+        tracing::warn!(
+            target: "voice",
+            model_dir = %config.model_dir.display(),
+            "the voice note transcribed to empty text; skipping the transcript"
+        );
         None
     } else {
         Some(text)
@@ -183,7 +200,18 @@ pub async fn resolve_transcript(
     let media = voice_note_media(event)?;
     let config = TranscriberConfig::from_env()?;
 
-    let bytes = rest_client.download_media(&media.url).await.ok()?;
+    let bytes = match rest_client.download_media(&media.url).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(
+                target: "voice",
+                url = %media.url,
+                error = %error,
+                "could not download the voice note blob; skipping transcription"
+            );
+            return None;
+        }
+    };
     if bytes.len() as u64 != media.size {
         // The blob does not match what the relay declared. Transcribing it
         // anyway would be acting on bytes the relay did not vouch for.
@@ -205,6 +233,11 @@ pub async fn resolve_transcript(
 /// container. Decoding to 16 kHz mono here means the recognizer never has to
 /// resample a 24 kHz voice note, which is where the resampling artifacts
 /// that cost accuracy come from.
+///
+/// Every failure path logs. Transcription is best-effort by design — a note
+/// the agent cannot hear still reaches it as an ordinary attachment — but a
+/// silent `None` here is indistinguishable from "no speech model configured",
+/// so a missing `ffmpeg` or a failed decode would be invisible in production.
 fn decode_voice_note(bytes: &[u8]) -> Option<(Vec<f32>, u32)> {
     const SAMPLE_RATE: u32 = 16_000;
 
@@ -214,7 +247,15 @@ fn decode_voice_note(bytes: &[u8]) -> Option<(Vec<f32>, u32)> {
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     ));
-    std::fs::write(&temp_path, bytes).ok()?;
+    if let Err(error) = std::fs::write(&temp_path, bytes) {
+        tracing::warn!(
+            target: "voice",
+            path = %temp_path.display(),
+            error = %error,
+            "could not stage the voice note for decoding; skipping transcription"
+        );
+        return None;
+    }
 
     let output = std::process::Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
@@ -222,12 +263,29 @@ fn decode_voice_note(bytes: &[u8]) -> Option<(Vec<f32>, u32)> {
         .args(["-f", "f32le", "-ar"])
         .arg(SAMPLE_RATE.to_string())
         .args(["-ac", "1", "pipe:1"])
-        .output()
-        .ok();
+        .output();
     let _ = std::fs::remove_file(&temp_path);
 
-    let output = output?;
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            // Most often a missing `ffmpeg` binary. Say so, loudly enough to
+            // find, but do not fail the turn — the attachment still arrives.
+            tracing::warn!(
+                target: "voice",
+                error = %error,
+                "could not run ffmpeg to decode the voice note; skipping transcription"
+            );
+            return None;
+        }
+    };
     if !output.status.success() || output.stdout.len() < 4 {
+        tracing::warn!(
+            target: "voice",
+            status = ?output.status,
+            stdout_bytes = output.stdout.len(),
+            "ffmpeg did not produce usable audio for the voice note; skipping transcription"
+        );
         return None;
     }
     let samples: Vec<f32> = output
@@ -236,6 +294,10 @@ fn decode_voice_note(bytes: &[u8]) -> Option<(Vec<f32>, u32)> {
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();
     if samples.is_empty() {
+        tracing::warn!(
+            target: "voice",
+            "the voice note decoded to no audio samples; skipping transcription"
+        );
         return None;
     }
     Some((samples, SAMPLE_RATE))
@@ -331,6 +393,67 @@ mod tests {
         } else {
             std::env::remove_var("BUZZ_VOICE_MODEL_TYPE");
         }
+    }
+
+    /// A decode failure must not be silent.
+    ///
+    /// Transcription is best-effort by design — a note the agent cannot hear
+    /// still reaches it as an ordinary attachment — but a swallowed failure
+    /// is indistinguishable from "no speech model configured". A missing
+    /// `ffmpeg` is the common case, and it must be visible in the log.
+    ///
+    /// This binds to the production seam: it captures what the real
+    /// `decode_voice_note` emits through `tracing`, not a test-only helper.
+    #[test]
+    fn a_decode_failure_is_logged_not_swallowed() {
+        use std::sync::{Arc, Mutex};
+
+        /// A `MakeWriter` that keeps every line it is handed.
+        #[derive(Clone, Default)]
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture buffer poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        // Bytes that are not a decodable container: ffmpeg exits non-zero.
+        let result = decode_voice_note(b"\x00\x01\x02\x03not a voice note");
+        drop(guard);
+
+        assert!(
+            result.is_none(),
+            "undecodable bytes must not produce samples"
+        );
+
+        let logged = String::from_utf8(captured.0.lock().expect("capture poisoned").clone())
+            .expect("captured log must be utf-8");
+        assert!(
+            logged.contains("ffmpeg did not produce usable audio"),
+            "a failed decode must be logged, got: {logged}"
+        );
     }
 
     /// End-to-end proof against a REAL canonical voice note and a REAL model.
