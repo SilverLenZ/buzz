@@ -419,14 +419,41 @@ mod tests {
         );
     }
 
+    /// The cap boundary is a PAIR, and the recognizer's guard is a strict `>`.
+    ///
+    /// Audio of EXACTLY the cap must be accepted (it goes on to the
+    /// recognizer), and one sample more must be rejected. Pinning only the
+    /// rejection side leaves the guard's comparison operator unconstrained —
+    /// flipping `>` to `>=` would silently reject a note that sits exactly
+    /// on the limit.
+    ///
+    /// This boundary matters because ffmpeg's `-t` is INCLUSIVE: a decode
+    /// trimmed to exactly the cap produces exactly `max_samples` samples, so
+    /// the caller must overshoot the cap to keep this rejection reachable.
     #[test]
-    fn audio_longer_than_the_cap_is_rejected() {
+    fn the_cap_boundary_is_inclusive_at_the_cap_and_rejected_one_over() {
         let config = TranscribeConfig::whisper("/nonexistent/model/dir");
-        let too_long = vec![0.0f32; (MAX_TRANSCRIBE_SECONDS as usize) * 16_000 + 1];
-        let error = transcribe(&too_long, 16_000, &config).expect_err("over-long audio must fail");
+        let cap_samples = (MAX_TRANSCRIBE_SECONDS as usize) * 16_000;
+
+        // Exactly at the cap: NOT a length rejection. It proceeds far enough
+        // to fail on the missing model, which proves the length guard let it
+        // through.
+        let at_cap = vec![0.0f32; cap_samples];
+        let error = transcribe(&at_cap, 16_000, &config)
+            .expect_err("a missing model must still fail at the cap");
         assert!(
-            matches!(error, TranscribeError::Audio(_)),
-            "expected an audio error, got {error:?}"
+            !matches!(error, TranscribeError::Audio(ref message) if message.contains("longer than")),
+            "audio of exactly the cap must not be rejected for its length, got {error:?}"
+        );
+
+        // One sample over: rejected for its length, with a message that
+        // names the limit.
+        let over_cap = vec![0.0f32; cap_samples + 1];
+        let error = transcribe(&over_cap, 16_000, &config)
+            .expect_err("audio one sample over the cap must fail");
+        assert!(
+            matches!(error, TranscribeError::Audio(ref message) if message.contains("longer than")),
+            "expected a length rejection, got {error:?}"
         );
     }
 

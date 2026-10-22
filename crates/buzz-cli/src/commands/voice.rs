@@ -238,12 +238,33 @@ mod tests {
 
         let (decoded, rate) = result.expect("ffmpeg must decode the fixture");
         assert_eq!(rate, 16_000);
-        // The decode is bounded to the cap plus the one second of headroom
-        // that keeps the recognizer's own rejection intact.
+
+        // Two bounds, because there are two bugs.
+        //
+        // UPPER: the decode must not exceed the cap plus one second. Without
+        // any `-t`, ffmpeg materialises the whole file, so the memory cost
+        // scales with the input rather than with the cap.
         let max_samples = ((MAX_TRANSCRIBE_SECONDS + 1.0) * 16_000.0) as usize;
         assert!(
             decoded.len() <= max_samples,
             "the decode must be bounded to {max_samples} samples, got {}",
+            decoded.len()
+        );
+
+        // LOWER: the decode must exceed the cap, so the recognizer's own
+        // strict `>` guard still fires and rejects the note.
+        //
+        // ffmpeg's `-t` is INCLUSIVE, so `-t` at exactly the cap yields
+        // exactly `max_samples` and `samples.len() > max_samples` is FALSE —
+        // an over-long note would silently transcribe as a partial note
+        // instead of being rejected. The one second of headroom is what
+        // keeps the rejection intact, so the bound must be MORE than the
+        // cap, not merely at most the cap.
+        let cap_samples = (MAX_TRANSCRIBE_SECONDS * 16_000.0) as usize;
+        assert!(
+            decoded.len() > cap_samples,
+            "the decode must exceed the cap ({cap_samples} samples) so the \
+             recognizer still rejects it, got {}",
             decoded.len()
         );
     }
