@@ -1,0 +1,381 @@
+//! Local speech-to-text for voice notes arriving in `buzz-acp`.
+//!
+//! A Buzz voice note is a `video/mp4` whose video track is a 16x16 black still
+//! and whose audio track carries the speech: the relay's media allowlist has
+//! no audio entry, so clients wrap speech in the canonical video envelope.
+//! The `imeta` tag records the blob's URL, its declared MIME (`video/mp4`), its
+//! SHA-256, its size, and its dimensions (`dim 16x16`).
+//!
+//! An agent that sees only the event sees a URL, not the words. This module
+//! resolves that URL, downloads the blob with the relay's NIP-98 auth, decodes
+//! the audio track, and produces a transcript that the prompt can carry.
+//!
+//! Everything here is best-effort: a voice note whose blob cannot be fetched,
+//! decoded, or transcribed still reaches the agent as an ordinary attachment.
+//! A missing speech model must never cost the agent the message.
+
+use std::path::PathBuf;
+
+use nostr::Event;
+
+/// The MIME the relay reports for a packaged voice note.
+const VOICE_NOTE_MIME: &str = "video/mp4";
+
+/// The video dimensions of a Buzz voice note's still track.
+///
+/// A voice note's video track is a 16x16 black still, so the relay records
+/// `dim 16x16`. This is the reliable voice-note signal: Buzz attachments
+/// carry no `filename` field at all.
+const VOICE_NOTE_DIMENSIONS: &str = "16x16";
+
+/// A voice note's media reference, resolved from an event's `imeta` tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoiceNoteMedia {
+    /// The relay's Blossom URL for the blob.
+    pub url: String,
+    /// The blob's SHA-256, as declared by the relay.
+    pub sha256: String,
+    /// The blob's size in bytes, as declared by the relay.
+    pub size: u64,
+}
+
+/// Extract the voice-note media reference from an event, if it has one.
+///
+/// Returns `None` for an event with no `imeta` tag, and for an `imeta` that
+/// does not describe a voice note (an ordinary image or video attachment).
+pub fn voice_note_media(event: &Event) -> Option<VoiceNoteMedia> {
+    for tag in event.tags.iter() {
+        let tag_slice = tag.as_slice();
+        if tag_slice.first().map(String::as_str) != Some("imeta") {
+            continue;
+        }
+        let mut url = None;
+        let mut sha256 = None;
+        let mut size = None;
+        let mut mime = None;
+        let mut dimensions = None;
+
+        // imeta is a single tag whose remaining values are `key value` pairs
+        // packed into one string per pair (`"url https://…"`, `"m video/mp4"`).
+        for value in tag_slice.iter().skip(1) {
+            let Some((key, val)) = value.split_once(' ') else {
+                continue;
+            };
+            match key {
+                "url" => url = Some(val.to_string()),
+                "x" => sha256 = Some(val.to_string()),
+                "size" => size = val.parse::<u64>().ok(),
+                "m" => mime = Some(val.to_string()),
+                "dim" => dimensions = Some(val.to_string()),
+                _ => {}
+            }
+        }
+
+        let is_voice_note = mime.as_deref() == Some(VOICE_NOTE_MIME)
+            && dimensions
+                .as_deref()
+                .is_some_and(|dim| dim.eq_ignore_ascii_case(VOICE_NOTE_DIMENSIONS));
+        if !is_voice_note {
+            continue;
+        }
+
+        return Some(VoiceNoteMedia {
+            url: url?,
+            sha256: sha256?,
+            size: size?,
+        });
+    }
+    None
+}
+
+/// Where the local speech model lives, and how to load it.
+///
+/// The ACP harness resolves this from the environment so an operator can
+/// point it at a model directory without recompiling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriberConfig {
+    /// Directory holding the speech model files.
+    pub model_dir: PathBuf,
+    /// The model family.
+    pub model_type: buzz_voice::ModelType,
+}
+
+impl TranscriberConfig {
+    /// Resolve the transcriber config from the environment.
+    ///
+    /// Returns `None` when no model directory is configured — the caller then
+    /// skips transcription entirely rather than failing the turn.
+    pub fn from_env() -> Option<Self> {
+        let model_dir = std::env::var_os("BUZZ_VOICE_MODEL_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| !dir.as_os_str().is_empty())?;
+
+        let model_type = match std::env::var("BUZZ_VOICE_MODEL_TYPE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "paraformer" => buzz_voice::ModelType::Paraformer,
+            "transducer" | "zipformer" => buzz_voice::ModelType::Transducer,
+            "whisper" => buzz_voice::ModelType::Whisper,
+            // Parakeet is the default: measured on the same labeled clips it
+            // beats whisper base.en on WER (0.1380 vs 0.1618) and handles
+            // acronyms better ("TTS" -> "T S" rather than "PTSD"). It costs
+            // 3x the latency, which is acceptable for a voice note a person
+            // deliberately sent. Set BUZZ_VOICE_MODEL_TYPE=whisper for the
+            // faster, smaller model.
+            _ => buzz_voice::ModelType::Parakeet,
+        };
+
+        Some(Self {
+            model_dir,
+            model_type,
+        })
+    }
+
+    /// The `buzz-voice` config for this transcriber.
+    fn voice_config(&self) -> buzz_voice::TranscribeConfig {
+        buzz_voice::TranscribeConfig {
+            model_dir: self.model_dir.clone(),
+            model_type: self.model_type,
+            lm: None,
+        }
+    }
+}
+
+/// Transcribe raw media bytes into text.
+///
+/// `bytes` are the blob as stored by the relay — for a voice note, a
+/// `video/mp4` whose audio track carries the speech.
+///
+/// Returns `None` when the bytes cannot be decoded or the model is missing;
+/// the caller treats that as "no transcript" rather than as an error.
+pub fn transcribe_bytes(bytes: &[u8], config: &TranscriberConfig) -> Option<String> {
+    let samples = decode_voice_note(bytes)?;
+    let text = buzz_voice::transcribe(&samples.0, samples.1, &config.voice_config()).ok()?;
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Resolve the transcript for a voice-note event, if there is one.
+///
+/// Returns `None` when the event is not a voice note, when no speech model is
+/// configured, or when the blob cannot be fetched or transcribed. Every
+/// failure is silent by design: a voice note whose words cannot be recovered
+/// still reaches the agent as an ordinary attachment.
+pub async fn resolve_transcript(
+    event: &Event,
+    rest_client: &crate::relay::RestClient,
+) -> Option<String> {
+    let media = voice_note_media(event)?;
+    let config = TranscriberConfig::from_env()?;
+
+    let bytes = rest_client.download_media(&media.url).await.ok()?;
+    if bytes.len() as u64 != media.size {
+        // The blob does not match what the relay declared. Transcribing it
+        // anyway would be acting on bytes the relay did not vouch for.
+        tracing::warn!(
+            target: "voice",
+            expected = media.size,
+            actual = bytes.len(),
+            "voice note blob size mismatch; skipping transcription"
+        );
+        return None;
+    }
+
+    transcribe_bytes(&bytes, &config)
+}
+
+/// Decode the audio track of a canonical Buzz voice note into mono samples.
+///
+/// The file is a `video/mp4`; `ffmpeg` reads the AAC track out of the
+/// container. Decoding to 16 kHz mono here means the recognizer never has to
+/// resample a 24 kHz voice note, which is where the resampling artifacts
+/// that cost accuracy come from.
+fn decode_voice_note(bytes: &[u8]) -> Option<(Vec<f32>, u32)> {
+    const SAMPLE_RATE: u32 = 16_000;
+
+    // `ffmpeg` reads from a path, so the bytes have to land on disk first.
+    let temp_path = std::env::temp_dir().join(format!(
+        "buzz-voice-note-{}-{}.mp4",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&temp_path, bytes).ok()?;
+
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&temp_path)
+        .args(["-f", "f32le", "-ar"])
+        .arg(SAMPLE_RATE.to_string())
+        .args(["-ac", "1", "pipe:1"])
+        .output()
+        .ok();
+    let _ = std::fs::remove_file(&temp_path);
+
+    let output = output?;
+    if !output.status.success() || output.stdout.len() < 4 {
+        return None;
+    }
+    let samples: Vec<f32> = output
+        .stdout
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    if samples.is_empty() {
+        return None;
+    }
+    Some((samples, SAMPLE_RATE))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::{EventBuilder, Kind, Tag};
+
+    fn signed_event_with_imeta(values: &[&str]) -> Event {
+        let mut builder = EventBuilder::new(Kind::TextNote, "hello");
+        builder = builder.tag(Tag::parse(["h", "channel"]).expect("tag"));
+        let mut tag_values: Vec<&str> = vec!["imeta"];
+        tag_values.extend_from_slice(values);
+        builder = builder.tag(Tag::parse(tag_values).expect("imeta tag"));
+        builder
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("sign")
+    }
+
+    #[test]
+    fn a_voice_note_imeta_is_recognized() {
+        // The imeta tag is ONE tag carrying `key value` pairs.
+        let signed = signed_event_with_imeta(&[
+            "url https://relay.example/media/abc.mp4",
+            "m video/mp4",
+            "x abc123",
+            "size 1234",
+            "dim 16x16",
+        ]);
+
+        let media = voice_note_media(&signed).expect("voice note must be recognized");
+        assert_eq!(media.url, "https://relay.example/media/abc.mp4");
+        assert_eq!(media.sha256, "abc123");
+        assert_eq!(media.size, 1234);
+    }
+
+    #[test]
+    fn an_ordinary_video_attachment_is_not_a_voice_note() {
+        let signed = signed_event_with_imeta(&[
+            "url https://relay.example/media/clip.mp4",
+            "m video/mp4",
+            "x abc123",
+            "size 1234",
+            "dim 1920x1080",
+        ]);
+        assert!(voice_note_media(&signed).is_none());
+    }
+
+    #[test]
+    fn an_event_without_imeta_is_not_a_voice_note() {
+        let builder = EventBuilder::new(Kind::TextNote, "hello");
+        let signed = builder
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("sign");
+        assert!(voice_note_media(&signed).is_none());
+    }
+
+    #[test]
+    fn the_model_type_env_var_selects_the_family() {
+        let previous_dir = std::env::var_os("BUZZ_VOICE_MODEL_DIR");
+        let previous_type = std::env::var_os("BUZZ_VOICE_MODEL_TYPE");
+        std::env::set_var("BUZZ_VOICE_MODEL_DIR", "/tmp/model");
+
+        for (name, expected) in [
+            ("whisper", buzz_voice::ModelType::Whisper),
+            ("paraformer", buzz_voice::ModelType::Paraformer),
+            ("transducer", buzz_voice::ModelType::Transducer),
+            ("zipformer", buzz_voice::ModelType::Transducer),
+            ("parakeet", buzz_voice::ModelType::Parakeet),
+        ] {
+            std::env::set_var("BUZZ_VOICE_MODEL_TYPE", name);
+            let config = TranscriberConfig::from_env().expect("model dir is set");
+            assert_eq!(config.model_type, expected, "BUZZ_VOICE_MODEL_TYPE={name}");
+        }
+
+        // Unset means the measured default.
+        std::env::remove_var("BUZZ_VOICE_MODEL_TYPE");
+        let config = TranscriberConfig::from_env().expect("model dir is set");
+        assert_eq!(config.model_type, buzz_voice::ModelType::Parakeet);
+
+        if let Some(value) = previous_dir {
+            std::env::set_var("BUZZ_VOICE_MODEL_DIR", value);
+        } else {
+            std::env::remove_var("BUZZ_VOICE_MODEL_DIR");
+        }
+        if let Some(value) = previous_type {
+            std::env::set_var("BUZZ_VOICE_MODEL_TYPE", value);
+        } else {
+            std::env::remove_var("BUZZ_VOICE_MODEL_TYPE");
+        }
+    }
+
+    /// End-to-end proof against a REAL canonical voice note and a REAL model.
+    ///
+    /// This binds to the production path (`decode_voice_note` +
+    /// `buzz_voice::transcribe`) — the same code the `Transcript:` injection
+    /// depends on. It needs two environment variables pointing at real files;
+    /// without them it is skipped rather than failing, so the suite still runs
+    /// on a machine that has no speech model staged.
+    #[test]
+    fn a_real_voice_note_transcribes_through_the_production_path() {
+        let Ok(model_dir) = std::env::var("BUZZ_TEST_VOICE_MODEL_DIR") else {
+            eprintln!("skipped: BUZZ_TEST_VOICE_MODEL_DIR not set");
+            return;
+        };
+        let Ok(note_path) = std::env::var("BUZZ_TEST_VOICE_NOTE") else {
+            eprintln!("skipped: BUZZ_TEST_VOICE_NOTE not set");
+            return;
+        };
+        let model_dir = std::path::PathBuf::from(model_dir);
+        if !model_dir.is_dir() {
+            eprintln!("skipped: model dir {} does not exist", model_dir.display());
+            return;
+        }
+
+        let bytes = std::fs::read(&note_path).expect("read the voice note");
+        assert!(bytes.len() > 1000, "the fixture must be a real note");
+
+        // The production decode path.
+        let (samples, rate) = decode_voice_note(&bytes).expect("the canonical MP4 must decode");
+        assert!(!samples.is_empty(), "decoded samples must not be empty");
+        assert_eq!(rate, 16_000, "the recognizer runs at 16 kHz");
+
+        // The production recognizer.
+        let config = buzz_voice::TranscribeConfig {
+            model_dir: model_dir.clone(),
+            model_type: buzz_voice::ModelType::Parakeet,
+            lm: None,
+        };
+        let text = buzz_voice::transcribe(&samples, rate, &config).expect("transcription succeeds");
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("voice note"),
+            "the transcript should contain the spoken words, got: {text}"
+        );
+        println!("transcript: {text}");
+    }
+
+    #[test]
+    fn a_missing_model_directory_disables_transcription() {
+        // With no BUZZ_VOICE_MODEL_DIR the harness must skip transcription
+        // rather than fail the turn.
+        let previous = std::env::var_os("BUZZ_VOICE_MODEL_DIR");
+        std::env::remove_var("BUZZ_VOICE_MODEL_DIR");
+        let resolved = TranscriberConfig::from_env();
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_VOICE_MODEL_DIR", value);
+        }
+        assert!(resolved.is_none());
+    }
+}

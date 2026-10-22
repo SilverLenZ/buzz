@@ -19,6 +19,12 @@ path = "src/main.rs"
 # Internal
 buzz-core = { workspace = true }
 buzz-sdk = { workspace = true }
+
+# Local speech-to-text — turns a voice note into words for the agent
+buzz-voice = { path = "../buzz-voice" }
+
+# Byte buffers returned by authenticated media downloads
+bytes = "1"
 buzz-persona = { path = "../buzz-persona" }
 
 # Git multicall helpers and ephemeral key ownership

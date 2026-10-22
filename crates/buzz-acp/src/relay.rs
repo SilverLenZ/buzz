@@ -491,6 +491,34 @@ impl RestClient {
         .await
     }
 
+    /// Download a Blossom media blob with NIP-98 auth.
+    ///
+    /// The relay's media read path requires a signed request: an unsigned GET
+    /// is rejected with 401, so a voice note's blob is unreachable without
+    /// this. `url` is the full Blossom URL as it appears in an event's `imeta`
+    /// tag.
+    pub async fn download_media(&self, url: &str) -> Result<bytes::Bytes, RelayError> {
+        let auth_header = self.nip98_header("GET", url, None)?;
+        let response = self
+            .http
+            .get(url)
+            .header("Authorization", auth_header)
+            .send()
+            .await
+            .map_err(|e| RelayError::Http(format!("media download failed: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelayError::Http(format!(
+                "media download returned {status}: {body}"
+            )));
+        }
+        response
+            .bytes()
+            .await
+            .map_err(|e| RelayError::Http(format!("media download body failed: {e}")))
+    }
+
     /// Query events via the HTTP bridge: `POST /query` with NIP-98 auth.
     ///
     /// Accepts a slice of `nostr::Filter` (serialized as JSON array).

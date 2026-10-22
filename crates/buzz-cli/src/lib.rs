@@ -10,6 +10,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use client::BuzzClient;
 use error::CliError;
 use nostr::Keys;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Run the Buzz CLI from raw arguments (including `argv[0]`).
@@ -299,6 +300,9 @@ enum Cmd {
     /// Upload files to the relay's Blossom store
     #[command(subcommand)]
     Upload(UploadCmd),
+    /// Local speech-to-text for voice notes and audio files
+    #[command(subcommand)]
+    Voice(VoiceCmd),
     /// Agent engram management — persistent memory per NIP-AE
     #[command(subcommand)]
     Mem(MemCmd),
@@ -1943,6 +1947,47 @@ pub enum MediaCmd {
     },
 }
 
+/// Speech model families the local transcriber supports.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum VoiceModelType {
+    /// Whisper — the same family Hermes' `faster-whisper` uses.
+    Whisper,
+    /// Paraformer.
+    Paraformer,
+    /// Zipformer transducer.
+    Transducer,
+    /// NeMo Parakeet TDT.
+    Parakeet,
+}
+
+impl VoiceModelType {
+    /// The `buzz-voice` model family this maps to.
+    pub fn as_model_type(self) -> buzz_voice::ModelType {
+        match self {
+            Self::Whisper => buzz_voice::ModelType::Whisper,
+            Self::Paraformer => buzz_voice::ModelType::Paraformer,
+            Self::Transducer => buzz_voice::ModelType::Transducer,
+            Self::Parakeet => buzz_voice::ModelType::Parakeet,
+        }
+    }
+}
+
+/// Subcommands for `buzz voice`.
+#[derive(Subcommand, Clone)]
+pub enum VoiceCmd {
+    /// Transcribe a local audio file or Buzz voice note to text (offline)
+    Transcribe {
+        /// Path to a WAV file, or any media file ffmpeg can read
+        input: String,
+        /// Directory holding the speech model files
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+        /// Speech model family
+        #[arg(long, value_enum, default_value = "whisper")]
+        model_type: VoiceModelType,
+    },
+}
+
 /// Subcommands for `buzz mem`.
 #[derive(Subcommand)]
 pub enum MemCmd {
@@ -2183,6 +2228,12 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         };
     }
 
+    // Voice transcription is local-only — it reads a local model and needs
+    // neither a relay connection nor a private key.
+    if let Cmd::Voice(ref sub) = cli.command {
+        return commands::voice::dispatch(sub.clone()).await;
+    }
+
     // Auth: private key is required for all relay operations.
     // The keypair IS the identity — no tokens, no other auth.
     let private_key_str = cli.private_key.ok_or_else(|| {
@@ -2244,6 +2295,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
         Cmd::Pack(_) => unreachable!("handled above"),
+        Cmd::Voice(_) => unreachable!("handled above"),
     }
 }
 
@@ -2434,6 +2486,7 @@ mod tests {
             "social",
             "upload",
             "users",
+            "voice",
             "workflows",
         ];
 

@@ -936,6 +936,8 @@ dependencies = [
  "buzz-core",
  "buzz-persona",
  "buzz-sdk",
+ "buzz-voice",
+ "bytes",
  "chrono",
  "clap",
  "evalexpr",
@@ -1107,6 +1109,7 @@ dependencies = [
  "buzz-core",
  "buzz-persona",
  "buzz-sdk",
+ "buzz-voice",
  "buzz-ws-client",
  "bytes",
  "chrono",
@@ -1122,6 +1125,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sherpa-onnx",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4841,6 +4845,13 @@ dependencies = [
  "hashbrown 0.16.1",
  "portable-atomic",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "keyconv"
+version = "0.1.0"
+dependencies = [
+ "nostr 0.44.7",
 ]
 
 [[package]]
