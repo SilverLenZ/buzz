@@ -300,7 +300,7 @@ enum Cmd {
     /// Upload files to the relay's Blossom store
     #[command(subcommand)]
     Upload(UploadCmd),
-    /// Local speech-to-text for voice notes and audio files
+    /// Local speech-to-text and text-to-speech for voice notes and audio files
     #[command(subcommand)]
     Voice(VoiceCmd),
     /// Agent engram management — persistent memory per NIP-AE
@@ -1994,6 +1994,23 @@ pub enum VoiceCmd {
         /// the ACP harness without a second download.
         #[arg(long, value_enum, default_value = "parakeet-ctc")]
         model_type: VoiceModelType,
+    },
+    /// Synthesize text into a Buzz voice note (offline)
+    Speak {
+        /// The text to speak
+        text: String,
+        /// Output path (a Buzz voice note mp4, unless `--wav` is given)
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Directory holding the Pocket TTS model files
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+        /// Reference voice WAV (defaults to reference_sample.wav in the model dir)
+        #[arg(long)]
+        voice: Option<PathBuf>,
+        /// Write raw PCM as a WAV instead of packaging a voice note mp4
+        #[arg(long, default_value_t = false)]
+        wav: bool,
     },
 }
 

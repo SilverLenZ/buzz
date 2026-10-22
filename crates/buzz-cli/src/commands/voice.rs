@@ -1,15 +1,17 @@
-//! `buzz voice` — local speech-to-text for voice notes and audio files.
+//! `buzz voice` — local speech-to-text and text-to-speech for voice notes and
+//! audio files.
 //!
 //! Runs entirely on the local machine: no relay connection, no network, no
-//! API key. The speech model is read from a local directory, so this command
-//! works offline and is usable as a building block by `buzz-acp`.
+//! API key. The speech models are read from a local directory, so these
+//! commands work offline and are usable as a building block by `buzz-acp`.
 //!
 //! A Buzz voice note is a `video/mp4` whose video track is a 16x16 black still
 //! and whose audio track carries the speech (the relay has no audio allowlist,
 //! so clients wrap speech in that envelope). Decoding one therefore means
-//! reading the AAC track out of an MP4 container.
+//! reading the AAC track out of an MP4 container; producing one means muxing
+//! the speech into that same envelope.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use buzz_voice::MAX_TRANSCRIBE_SECONDS;
 
@@ -23,6 +25,13 @@ pub async fn dispatch(cmd: crate::VoiceCmd) -> Result<(), CliError> {
             model_dir,
             model_type,
         } => transcribe_command(&input, &model_dir, model_type),
+        crate::VoiceCmd::Speak {
+            text,
+            output,
+            model_dir,
+            voice,
+            wav,
+        } => speak_command(&text, &output, &model_dir, &voice, wav),
     }
 }
 
@@ -59,6 +68,272 @@ fn transcribe_command(
 
     println!("{text}");
     Ok(())
+}
+
+/// Synthesize `text` into a speech file, offline.
+///
+/// The model directory is resolved from `--model-dir`, or from
+/// `BUZZ_TTS_MODEL_DIR` when the flag is omitted. The reference voice is
+/// resolved from `--voice` (a WAV path) or from `reference_sample.wav` inside
+/// the model directory.
+///
+/// By default the output is a Buzz voice note: an mp4 whose video track is a
+/// 16x16 black still and whose audio track carries the speech. Pass `--wav`
+/// to write the raw PCM instead, which is useful for checking the synthesis
+/// without the container.
+fn speak_command(
+    text: &str,
+    output: &Option<PathBuf>,
+    model_dir: &Option<PathBuf>,
+    voice: &Option<PathBuf>,
+    wav: bool,
+) -> Result<(), CliError> {
+    let model_dir = match model_dir {
+        Some(dir) => dir.clone(),
+        None => std::env::var_os("BUZZ_TTS_MODEL_DIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                CliError::Usage(
+                    "no TTS model directory: pass --model-dir or set BUZZ_TTS_MODEL_DIR"
+                        .to_string(),
+                )
+            })?,
+    };
+
+    let tts = buzz_voice::load_text_to_speech(&model_dir.to_string_lossy())
+        .map_err(|error| CliError::Other(error))?;
+
+    let voice_path = match voice {
+        Some(path) => path.clone(),
+        None => model_dir.join(format!(
+            "{}.{}",
+            buzz_voice::DEFAULT_VOICE,
+            buzz_voice::VOICE_FILE_EXT
+        )),
+    };
+    let style = buzz_voice::load_voice_style(&voice_path).map_err(|error| {
+        CliError::Other(format!("reference voice: {error} (looked in {})", voice_path.display()))
+    })?;
+
+    let samples = tts
+        .synth_chunk(text, "en", &style, 0)
+        .map_err(|error| CliError::Other(error))?;
+    if samples.is_empty() {
+        return Err(CliError::Other("synthesis produced no audio".to_string()));
+    }
+
+    let rate = buzz_voice::SAMPLE_RATE;
+    let samples = trim_trailing_silence(&samples, rate);
+
+    let out_path = match output {
+        Some(path) => path.clone(),
+        None => PathBuf::from("voice-note.mp4"),
+    };
+
+    if wav {
+        write_wav(&out_path, &samples, rate)?;
+    } else {
+        // Mux into the Buzz voice-note envelope: a 16x16 black still at 1 fps
+        // plus the speech as AAC, exactly as the desktop packages it.
+        let wav_path = out_path.with_extension("voice-tmp.wav");
+        write_wav(&wav_path, &samples, rate)?;
+        let result = mux_voice_note(&wav_path, &out_path);
+        let _ = std::fs::remove_file(&wav_path);
+        result?;
+    }
+
+    println!("{}", out_path.display());
+    Ok(())
+}
+
+/// Trim trailing silence from synthesized audio, keeping a short natural tail.
+///
+/// The relay validates a voice-note upload with `validate_video_file()` and
+/// stores `VideoMeta::duration_secs`, then the imeta handler requires the
+/// declared `duration` to match that stored value within ±0.1s
+/// (`buzz-relay/src/handlers/imeta.rs`). The stored duration comes from the mp4
+/// track header, and the video track is cut to the audio's length, so any
+/// trailing silence in the synthesized PCM inflates the stored duration and
+/// pushes the two apart.
+///
+/// Measured on a real synthesis: the engine emits ~0.11s of trailing silence,
+/// which put the drift at 0.48s — over four times the tolerance. Trimming it
+/// brings the drift to 0.008s.
+///
+/// The tail is kept short but non-zero so the note does not end abruptly.
+fn trim_trailing_silence(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    const TAIL_MS: u32 = 20;
+    const THRESHOLD: f32 = 0.01;
+
+    let peak = samples.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
+    if peak <= 0.0 {
+        return samples.to_vec();
+    }
+    let threshold = peak * THRESHOLD;
+
+    let last = samples
+        .iter()
+        .rposition(|s| s.abs() > threshold)
+        .unwrap_or(0);
+    let keep = (last + (sample_rate * TAIL_MS / 1000) as usize).min(samples.len());
+    samples[..keep].to_vec()
+}
+
+/// Write mono 16-bit PCM samples as a WAV file.
+fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), CliError> {
+    let mut pcm = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        pcm.extend_from_slice(&((clamped * i16::MAX as f32) as i16).to_le_bytes());
+    }
+
+    let mut bytes = Vec::with_capacity(44 + pcm.len());
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&((36 + pcm.len()) as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&pcm);
+
+    std::fs::write(path, &bytes)
+        .map_err(|error| CliError::Other(format!("write {}: {error}", path.display())))
+}
+
+/// Wrap a speech WAV in the Buzz voice-note envelope (mp4, 16x16 still + AAC).
+///
+/// The video track is a 16x16 black still, exactly as the desktop packages it,
+/// but at 25 fps rather than 1 fps. The relay validates an upload with
+/// `validate_video_file()` and stores `VideoMeta::duration_secs`, then the
+/// imeta handler requires the declared `duration` to match that stored value
+/// within ±0.1s (`buzz-relay/src/handlers/imeta.rs`). The stored duration comes
+/// from the mp4 track header, so the video track's length has to match the
+/// audio's. At 1 fps the video quantizes to whole seconds and a 4.8s note
+/// stores as 4.0s — an 0.8s drift, far outside the tolerance, which makes the
+/// relay reject the upload. At 25 fps the track is quantized to 40ms, so the
+/// drift stays under 0.02s across every duration measured (1s to 31.7s).
+///
+/// The still image is unchanged — only the frame rate differs, so the track
+/// is still a single black 16x16 frame repeated.
+fn mux_voice_note(wav: &Path, output: &Path) -> Result<(), CliError> {
+    // The video track is cut to the audio's length with an explicit `-t`
+    // rather than `-shortest`. `-shortest` cannot be used here: the `color`
+    // lavfi source is infinite, and letting ffmpeg resolve "shortest" against
+    // it fails with a misleading "No space left on device" (exit 228).
+    let seconds = wav_duration_seconds(wav)?;
+    let duration_arg = format!("{seconds:.3}");
+
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=16x16:r=25",
+        ])
+        .arg("-i")
+        .arg(wav)
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-t",
+            &duration_arg,
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-sn",
+            "-dn",
+            "-fflags",
+            "+bitexact",
+            "-flags:v",
+            "+bitexact",
+            "-flags:a",
+            "+bitexact",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "stillimage",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-movflags",
+            "+faststart",
+            "-metadata",
+            "encoder=",
+        ])
+        .arg(output)
+        .status()
+        .map_err(|error| {
+            CliError::Other(format!(
+                "ffmpeg is required to package a voice note: {error}"
+            ))
+        })?;
+
+    if !status.success() {
+        return Err(CliError::Other(format!(
+            "ffmpeg failed to package the voice note (exit {status})"
+        )));
+    }
+    Ok(())
+}
+
+/// Read a mono WAV's duration in seconds.
+///
+/// Parses the RIFF chunks rather than assuming the `data` chunk sits at a
+/// fixed offset — ffmpeg writes a `LIST` chunk before it.
+fn wav_duration_seconds(path: &Path) -> Result<f64, CliError> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| CliError::Other(format!("read {}: {error}", path.display())))?;
+
+    let mut sample_rate = 0u32;
+    let mut data_len = 0u32;
+    let mut pos = 12usize; // past "RIFF" + size + "WAVE"
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        if id == b"fmt " {
+            sample_rate = u32::from_le_bytes([
+                bytes[pos + 12],
+                bytes[pos + 13],
+                bytes[pos + 14],
+                bytes[pos + 15],
+            ]);
+        }
+        if id == b"data" {
+            data_len = size as u32;
+        }
+        pos += 8 + size + (size & 1);
+    }
+
+    if sample_rate == 0 || data_len == 0 {
+        return Err(CliError::Other(format!(
+            "{} is not a usable mono 16-bit WAV",
+            path.display()
+        )));
+    }
+    Ok(data_len as f64 / 2.0 / sample_rate as f64)
 }
 
 /// Decode `input` into mono samples and its sample rate.
