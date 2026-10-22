@@ -110,27 +110,11 @@ impl TranscriberConfig {
             .map(PathBuf::from)
             .filter(|dir| !dir.as_os_str().is_empty())?;
 
-        let model_type = match std::env::var("BUZZ_VOICE_MODEL_TYPE")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "paraformer" => buzz_voice::ModelType::Paraformer,
-            "transducer" | "zipformer" => buzz_voice::ModelType::Transducer,
-            "whisper" => buzz_voice::ModelType::Whisper,
-            // Parakeet TDT-CTC is the default: it is the layout the Buzz
-            // desktop ships (`parakeet-tdt-ctc-110m-en`, a single `model.int8.onnx`
-            // + `tokens.txt`), so the same model directory works on both sides
-            // without a second download. It also decodes with CTC blank tokens,
-            // which removes the silence/cut-audio hallucination class that hurts
-            // encoder-decoder models on short notes.
-            //
-            // The older TDT triple (encoder/decoder/joiner) is still selectable
-            // as "parakeet" for a 0.6b release; it is not the default because
-            // it cannot load the 110M CTC model.
-            "parakeet" | "parakeet_tdt" => buzz_voice::ModelType::Parakeet,
-            _ => buzz_voice::ModelType::ParakeetCtc,
-        };
+        let model_type = model_type_from_env(
+            std::env::var("BUZZ_VOICE_MODEL_TYPE")
+                .unwrap_or_default()
+                .as_str(),
+        );
 
         Some(Self {
             model_dir,
@@ -145,6 +129,27 @@ impl TranscriberConfig {
             model_type: self.model_type,
             lm: None,
         }
+    }
+}
+
+/// Map a `BUZZ_VOICE_MODEL_TYPE` value to a model family.
+///
+/// Parakeet TDT-CTC is the default: it is the layout the Buzz desktop ships
+/// (`parakeet-tdt-ctc-110m-en`, a single `model.int8.onnx` + `tokens.txt`), so
+/// the same model directory works on both sides without a second download. It
+/// also decodes with CTC blank tokens, which removes the silence/cut-audio
+/// hallucination class that hurts encoder-decoder models on short notes.
+///
+/// The older TDT triple (encoder/decoder/joiner) is still selectable as
+/// "parakeet" for a 0.6b release; it is not the default because it cannot load
+/// the 110M CTC model.
+fn model_type_from_env(raw: &str) -> buzz_voice::ModelType {
+    match raw.to_ascii_lowercase().as_str() {
+        "paraformer" => buzz_voice::ModelType::Paraformer,
+        "transducer" | "zipformer" => buzz_voice::ModelType::Transducer,
+        "whisper" => buzz_voice::ModelType::Whisper,
+        "parakeet" | "parakeet_tdt" => buzz_voice::ModelType::Parakeet,
+        _ => buzz_voice::ModelType::ParakeetCtc,
     }
 }
 
@@ -359,10 +364,17 @@ mod tests {
         assert!(!samples.is_empty(), "decoded samples must not be empty");
         assert_eq!(rate, 16_000, "the recognizer runs at 16 kHz");
 
-        // The production recognizer.
+        // The production recognizer. The model family is resolved the same
+        // way production resolves it, so this test cannot drift away from the
+        // default the harness actually uses.
+        let model_type = model_type_from_env(
+            std::env::var("BUZZ_VOICE_MODEL_TYPE")
+                .unwrap_or_default()
+                .as_str(),
+        );
         let config = buzz_voice::TranscribeConfig {
             model_dir: model_dir.clone(),
-            model_type: buzz_voice::ModelType::Parakeet,
+            model_type,
             lm: None,
         };
         let text = buzz_voice::transcribe(&samples, rate, &config).expect("transcription succeeds");
@@ -372,6 +384,33 @@ mod tests {
             "the transcript should contain the spoken words, got: {text}"
         );
         println!("transcript: {text}");
+    }
+
+    #[test]
+    fn the_default_model_family_is_the_ctc_layout_the_desktop_ships() {
+        // The Buzz desktop ships `parakeet-tdt-ctc-110m-en`: a single
+        // `model.int8.onnx` + `tokens.txt`. The default must therefore be the
+        // CTC family, and an unset `BUZZ_VOICE_MODEL_TYPE` must resolve to it.
+        assert_eq!(
+            model_type_from_env(""),
+            buzz_voice::ModelType::ParakeetCtc,
+            "an unset model type must resolve to the CTC layout"
+        );
+        assert_eq!(
+            model_type_from_env("parakeet-ctc"),
+            buzz_voice::ModelType::ParakeetCtc,
+            "the explicit CTC spelling must resolve to the CTC layout"
+        );
+        // The TDT triple is opt-in for the 0.6b release only.
+        assert_eq!(
+            model_type_from_env("parakeet"),
+            buzz_voice::ModelType::Parakeet
+        );
+        assert_eq!(
+            model_type_from_env("PARAKEET-TDT"),
+            buzz_voice::ModelType::ParakeetCtc,
+            "the model type match is case-insensitive"
+        );
     }
 
     #[test]

@@ -2399,19 +2399,6 @@ fn send_prompt_result(
     });
 }
 
-/// Core async function spawned for each prompt.
-///
-/// Lifecycle:
-/// 1. Resolve or create a session (channel or heartbeat).
-/// 2. Send `initial_message` on new channel sessions (if configured).
-/// 3. Fetch conversation context if needed (thread reply or DM).
-/// 4. Build the prompt text from batch + context.
-/// 5. Send the actual prompt with turn timeout.
-/// 6. Handle all error paths, always returning the agent via `result_tx`.
-///
-/// The agent is ALWAYS returned — even on panic the `JoinSet` detects the
-/// abort and the caller uses `task_map` to recover the agent index.
-#[allow(clippy::too_many_arguments)]
 /// Transcribe every voice note in a batch, keyed by event id.
 ///
 /// Returns an empty map when no voice note is present, when no speech model is
@@ -2443,6 +2430,19 @@ async fn resolve_batch_transcripts(
     transcripts
 }
 
+/// Core async function spawned for each prompt.
+///
+/// Lifecycle:
+/// 1. Resolve or create a session (channel or heartbeat).
+/// 2. Send `initial_message` on new channel sessions (if configured).
+/// 3. Fetch conversation context if needed (thread reply or DM).
+/// 4. Build the prompt text from batch + context.
+/// 5. Send the actual prompt with turn timeout.
+/// 6. Handle all error paths, always returning the agent via `result_tx`.
+///
+/// The agent is ALWAYS returned — even on panic the `JoinSet` detects the
+/// abort and the caller uses `task_map` to recover the agent index.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_prompt_task(
     mut agent: OwnedAgent,
     batch: Option<FlushBatch>,

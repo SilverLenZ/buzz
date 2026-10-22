@@ -266,7 +266,6 @@ fn build_recognizer(config: &TranscribeConfig) -> Result<OfflineRecognizer, Tran
                 encoder: Some(resolve_file(dir, "encoder.onnx")?),
                 decoder: Some(resolve_file(dir, "decoder.onnx")?),
                 joiner: Some(resolve_file(dir, "joiner.onnx")?),
-                ..Default::default()
             };
         }
         ModelType::ParakeetCtc => {
@@ -276,8 +275,10 @@ fn build_recognizer(config: &TranscribeConfig) -> Result<OfflineRecognizer, Tran
         }
     }
 
-    let mut recognizer_config = OfflineRecognizerConfig::default();
-    recognizer_config.model_config = model_config;
+    let mut recognizer_config = OfflineRecognizerConfig {
+        model_config,
+        ..Default::default()
+    };
     if let Some(lm) = config.lm.as_ref() {
         recognizer_config.lm_config = sherpa_onnx::OfflineLMConfig {
             model: Some(lm.display().to_string()),
