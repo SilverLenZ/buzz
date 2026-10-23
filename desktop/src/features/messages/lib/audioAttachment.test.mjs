@@ -8,6 +8,7 @@ import {
   isVoiceNoteFile,
   nextVoiceNotePlaybackRate,
   resolveAudioAttachment,
+  isTerminalMediaError,
   shouldReportPlaybackError,
   summarizeWaveform,
   VOICE_NOTE_MAX_DURATION_SECONDS,
@@ -183,4 +184,18 @@ test("a gesture-less play rejection does not mark the audio unavailable", () => 
   );
   assert.equal(shouldReportPlaybackError(new Error("boom")), true);
   assert.equal(shouldReportPlaybackError(undefined), true);
+});
+
+test("a load interrupted before playback is transient, not broken audio", () => {
+  // A retry or source change aborts the pending play(); the attachment is still
+  // playable, so this must not flip the card into its unavailable state.
+  assert.equal(shouldReportPlaybackError({ name: "AbortError" }), false);
+});
+
+test("only decode, source, and unclassified media errors are terminal", () => {
+  assert.equal(isTerminalMediaError(1), false); // MEDIA_ERR_ABORTED
+  assert.equal(isTerminalMediaError(2), false); // MEDIA_ERR_NETWORK
+  assert.equal(isTerminalMediaError(3), true); // MEDIA_ERR_DECODE
+  assert.equal(isTerminalMediaError(4), true); // MEDIA_ERR_SRC_NOT_SUPPORTED
+  assert.equal(isTerminalMediaError(undefined), true); // unknown failure
 });
