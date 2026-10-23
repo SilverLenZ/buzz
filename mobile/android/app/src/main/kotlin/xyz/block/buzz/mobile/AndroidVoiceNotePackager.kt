@@ -65,6 +65,17 @@ internal fun audioDurationFromFrameCountUs(frames: Long, sampleRate: Int): Long 
     return frames * AAC_FRAME_SAMPLES * 1_000_000L / sampleRate
 }
 
+/**
+ * Presentation times for the two black envelope frames.
+ *
+ * MediaMuxer derives every `stts` entry from the gap to the next sample and
+ * repeats the last gap for the final sample, so samples at 0 and [durationUs]
+ * make the track claim twice the note's length — the exact symptom players
+ * showed. Halving the gap makes the track total match [durationUs].
+ */
+internal fun envelopeFrameTimesUs(durationUs: Long): LongArray =
+    longArrayOf(0L, durationUs / 2)
+
 internal object AndroidVoiceNotePackager {
     private const val sampleWalkBufferSize = 64 * 1024
 
@@ -238,7 +249,7 @@ internal object AndroidVoiceNotePackager {
                 MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4,
             )
             val frame = blackYuv420Frame()
-            val frameTimesUs = longArrayOf(0L, durationUs)
+            val frameTimesUs = envelopeFrameTimesUs(durationUs)
             val bufferInfo = MediaCodec.BufferInfo()
             var nextFrame = 0
             var inputEnded = false

@@ -50,10 +50,21 @@ class AndroidVoiceNotePackagerTest {
     }
 
     @Test
+    fun `envelope frames total the requested duration`() {
+        // MediaMuxer repeats the last inter-sample gap for the final sample, so
+        // two frames must sit half a duration apart or the track claims double
+        // the note's length.
+        val times = envelopeFrameTimesUs(durationUs = 10_611_519L)
+        assertEquals(2, times.size)
+        assertEquals(0L, times[0])
+        assertEquals(5_305_759L, times[1])
+        assertEquals(10_611_518L, times[1] * 2)
+    }
+
+    @Test
     fun `audio duration counts frames instead of trusting timestamps`() {
-        // The recorder writes timestamps at half rate: this take's 583 frames
-        // carry 13.537 s of audio but declare 27.074 s, which is what every
-        // player was showing before the envelope stopped using the header.
+        // The recorder writes its own duration at half rate: this take's 583
+        // frames carry 13.537 s of audio but the header declares 27.074 s.
         assertEquals(13_537_233L, audioDurationFromFrameCountUs(frames = 583, sampleRate = 44_100))
         assertEquals(0L, audioDurationFromFrameCountUs(frames = 0, sampleRate = 44_100))
         assertEquals(0L, audioDurationFromFrameCountUs(frames = 583, sampleRate = 0))
