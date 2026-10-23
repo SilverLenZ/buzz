@@ -74,14 +74,28 @@ class AndroidMediaSanitizerMp4Test {
 
             val scrubbed = scrub(original)
 
+            val before = topLevelBoxes(original).single { it.type == "mdat" }
             val mdat = topLevelBoxes(scrubbed).single { it.type == "mdat" }
             assertEquals(8, mdat.headerSize, "$case mdat must use a compact size field")
-            assertTrue(
-                chunkOffsets(scrubbed).all { it >= mdat.bodyStart && it < mdat.end },
-                "$case every chunk offset must land inside mdat",
+            // Exact offsets, measured from the box geometry: an offset that
+            // merely lands "somewhere inside mdat" would not catch a missing
+            // header-size term in the sanitizer's shift.
+            val payloadShift = mdat.bodyStart - before.bodyStart
+            assertEquals(
+                chunkOffsets(original).map { it + payloadShift },
+                chunkOffsets(scrubbed),
+                "$case chunk offsets must follow the shrunk header",
             )
             assertContentEquals(mdatPayload(original), mdatPayload(scrubbed), case)
         }
+    }
+
+    @Test
+    fun `scrubMp4File fails closed for fragmented containers`() {
+        // moof/sidx offsets are not rewritten, so a fragmented input must not
+        // be silently turned into a fast-start file with stale fragment offsets.
+        val fragmented = canonicalMp4() + box("moof", ByteArray(32) { 9 })
+        assertFailsWith<IllegalArgumentException> { scrub(fragmented) }
     }
 
     @Test

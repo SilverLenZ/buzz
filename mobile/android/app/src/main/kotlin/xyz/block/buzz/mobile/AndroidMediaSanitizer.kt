@@ -149,6 +149,12 @@ internal object AndroidMediaSanitizer {
         val mdatBoxes = boxes.filter { it.type == "mdat" }
         require(moovBoxes.size == 1) { "Invalid MP4: expected one moov box" }
         require(mdatBoxes.size == 1) { "Invalid MP4: expected one mdat box" }
+        // Fragmented containers carry their offsets in moof/sidx, which this
+        // rewrite does not touch. Fail closed rather than emit a fast-start file
+        // whose fragment offsets point at the wrong bytes.
+        require(boxes.none { it.type == "moof" || it.type == "styp" || it.type == "sidx" }) {
+            "Fragmented MP4 is not supported"
+        }
         val moovBox = moovBoxes.single()
         val mdatBox = mdatBoxes.single()
 

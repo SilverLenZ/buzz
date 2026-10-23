@@ -195,17 +195,25 @@ internal object AndroidVoiceNotePackager {
         outputFile: File,
         durationUs: Long,
     ) {
-        var failure: Exception? = null
+        var primaryFailure: Exception? = null
         for (codecName in listOf(null, softwareVideoEncoderName)) {
             try {
                 writeBlackVideoTrack(outputFile, durationUs, codecName)
                 return
             } catch (error: Exception) {
-                failure = error
+                // Keep the device encoder's failure as the reported cause: the
+                // fallback can fail for its own reasons (the software encoder is
+                // absent on some builds), and that would hide what the device
+                // actually refused.
+                if (primaryFailure == null) {
+                    primaryFailure = error
+                } else {
+                    primaryFailure.addSuppressed(error)
+                }
                 outputFile.delete()
             }
         }
-        failure?.let { throw it }
+        primaryFailure?.let { throw it }
         throw IllegalStateException("Unable to create the voice note envelope.")
     }
 
