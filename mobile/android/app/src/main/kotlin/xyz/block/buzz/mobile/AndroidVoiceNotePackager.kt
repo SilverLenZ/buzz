@@ -36,7 +36,25 @@ internal data class VoiceNoteVideoEnvelope(
     val frameRate: Int,
 )
 
+/**
+ * Length of the hidden video track, in microseconds.
+ *
+ * The recorder's `.m4a` header can declare far more audio than the sample
+ * table contains — observed on Samsung hardware as 21.5 s declared for 10.8 s
+ * of AAC — and sizing the envelope from that number makes every player show the
+ * inflated length, then sit in silence for the difference. The sample timeline
+ * is what actually plays, so it wins whenever it can be read; the declared
+ * duration is only a fallback for tracks whose samples could not be walked.
+ */
+internal fun envelopeDurationUs(
+    declaredUs: Long,
+    measuredUs: Long,
+): Long = if (measuredUs > 0) measuredUs else declaredUs
+
 internal object AndroidVoiceNotePackager {
+    private const val sampleWalkBufferSize = 64 * 1024
+    private const val aacFrameSamples = 1024L
+
     private const val dequeueTimeoutUs = 10_000L
     // Each encoder attempt gets half the previous single-attempt budget, so a
     // hung hardware encoder still fails within the same total time.
@@ -102,17 +120,47 @@ internal object AndroidVoiceNotePackager {
                 val format = extractor.getTrackFormat(index)
                 val mimeType = format.getString(MediaFormat.KEY_MIME) ?: continue
                 if (!mimeType.startsWith("audio/")) continue
-                val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                val declaredUs = if (format.containsKey(MediaFormat.KEY_DURATION)) {
                     format.getLong(MediaFormat.KEY_DURATION)
                 } else {
                     0L
                 }
-                return AudioTrack(index, durationUs, mimeType)
+                val sampleRate = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                    format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                } else {
+                    0
+                }
+                val measuredUs = measureSampleTimelineUs(extractor, index, sampleRate)
+                return AudioTrack(index, envelopeDurationUs(declaredUs, measuredUs), mimeType)
             }
             throw IllegalArgumentException("The recording does not contain an audio track.")
         } finally {
             extractor.release()
         }
+    }
+
+    /**
+     * End of the audio the file actually plays: the last sample's timestamp
+     * plus one AAC frame, read from the sample table rather than the header.
+     *
+     * Returns 0 when the track has no readable samples, so the caller can fall
+     * back to the declared duration.
+     */
+    private fun measureSampleTimelineUs(
+        extractor: MediaExtractor,
+        trackIndex: Int,
+        sampleRate: Int,
+    ): Long {
+        extractor.selectTrack(trackIndex)
+        val buffer = ByteBuffer.allocate(sampleWalkBufferSize)
+        var lastSampleUs = -1L
+        while (true) {
+            if (extractor.readSampleData(buffer, 0) < 0) break
+            lastSampleUs = extractor.sampleTime
+            if (!extractor.advance()) break
+        }
+        if (lastSampleUs < 0 || sampleRate <= 0) return 0L
+        return lastSampleUs + aacFrameSamples * 1_000_000L / sampleRate
     }
 
     private fun writeBlackVideoTrack(
