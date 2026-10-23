@@ -62,6 +62,29 @@ class AndroidMediaSanitizerMp4Test {
     }
 
     @Test
+    fun `scrubMp4File shrinks a 64-bit mdat header so WebKit accepts the file`() {
+        // MediaMuxer writes mdat with a 64-bit size field. WebKitGTK rejects
+        // such a file outright (MEDIA_ERR_SRC_NOT_SUPPORTED) even though ffmpeg
+        // and ExoPlayer play it, which is why desktop playback of every voice
+        // note failed while the phone was fine.
+        for (moovFirst in listOf(true, false)) {
+            val case = "moovFirst=$moovFirst"
+            val original = androidMuxerMp4(moovFirst = moovFirst, co64 = true, largeMdat = true)
+            assertEquals(16, topLevelBoxes(original).single { it.type == "mdat" }.headerSize, case)
+
+            val scrubbed = scrub(original)
+
+            val mdat = topLevelBoxes(scrubbed).single { it.type == "mdat" }
+            assertEquals(8, mdat.headerSize, "$case mdat must use a compact size field")
+            assertTrue(
+                chunkOffsets(scrubbed).all { it >= mdat.bodyStart && it < mdat.end },
+                "$case every chunk offset must land inside mdat",
+            )
+            assertContentEquals(mdatPayload(original), mdatPayload(scrubbed), case)
+        }
+    }
+
+    @Test
     fun `scrubMp4File repairs a real MediaMuxer envelope`() {
         // ffmpeg-encoded H.264/AAC, laid out with mdat before moov the way
         // MPEG4Writer does once its ~3 KiB moov reserve is exhausted. The
@@ -203,10 +226,18 @@ class AndroidMediaSanitizerMp4Test {
      * fast-start order a short recording gets or the trailing order a longer
      * one gets once the moov outgrows the reserve.
      */
-    private fun androidMuxerMp4(moovFirst: Boolean, co64: Boolean): ByteArray {
+    private fun androidMuxerMp4(
+        moovFirst: Boolean,
+        co64: Boolean,
+        largeMdat: Boolean = false,
+    ): ByteArray {
         val ftyp = ftypBox()
         val reserved = box("free", ByteArray(2048))
-        val mdat = box("mdat", ByteArray(512) { (it * 7).toByte() })
+        val mdatBody = ByteArray(512) { (it * 7).toByte() }
+        val mdat = if (largeMdat) box64("mdat", mdatBody) else box("mdat", mdatBody)
+        // Chunk offsets point at the payload, which starts after whichever
+        // header shape the muxer wrote.
+        val payloadOffset = if (largeMdat) 16L else 8L
         // Chunk offsets are absolute, and the moov has a fixed width whatever
         // the offsets hold, so measuring a placeholder moov is exact.
         val placeholder = moovBox(co64, listOf(0L, 0L))
@@ -215,7 +246,8 @@ class AndroidMediaSanitizerMp4Test {
         } else {
             ftyp.size + reserved.size
         }
-        val moov = moovBox(co64, listOf(mdatStart + 8L, mdatStart + 8L + 256L))
+        val firstChunk = mdatStart + payloadOffset
+        val moov = moovBox(co64, listOf(firstChunk, firstChunk + 256L))
         return if (moovFirst) ftyp + reserved + moov + mdat else ftyp + reserved + mdat + moov
     }
 
@@ -408,6 +440,16 @@ class AndroidMediaSanitizerMp4Test {
         val output = ByteArrayOutputStream()
         output.write(int32(payload.size + 8))
         output.write(type)
+        output.write(payload)
+        return output.toByteArray()
+    }
+
+    /** A box with the 64-bit size field MediaMuxer writes for `mdat`. */
+    private fun box64(type: String, payload: ByteArray): ByteArray {
+        val output = ByteArrayOutputStream()
+        output.write(int32(1))
+        output.write(type.toByteArray(StandardCharsets.US_ASCII))
+        output.write(long64(payload.size + 16L))
         output.write(payload)
         return output.toByteArray()
     }

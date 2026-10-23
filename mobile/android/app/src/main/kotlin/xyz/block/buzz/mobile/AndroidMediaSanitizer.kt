@@ -155,6 +155,22 @@ internal object AndroidMediaSanitizer {
         val moovBody = filterMp4Metadata(readMp4BoxBody(container, moovBox), 0)
         val moovSize = moovBody.size.toLong() + MP4_BOX_HEADER_BYTES
 
+        // MediaMuxer writes `mdat` with a 64-bit size field. WebKit's media
+        // stack refuses the whole file when it sees one (MEDIA_ERR_SRC_NOT_SUPPORTED),
+        // while ffmpeg and ExoPlayer accept it, so desktop playback of every
+        // envelope we produced failed. The body is far below the 32-bit limit
+        // for anything we upload, so shrink the header and keep the sample data.
+        val mdatBodySize = mdatBox.size - mdatBox.headerSize
+        val mdatHeaderSize = if (
+            mdatBox.headerSize == MP4_LARGE_BOX_HEADER_BYTES &&
+            mdatBodySize + MP4_BOX_HEADER_BYTES <= Int.MAX_VALUE
+        ) {
+            MP4_BOX_HEADER_BYTES
+        } else {
+            mdatBox.headerSize
+        }
+        val mdatSize = mdatBodySize + mdatHeaderSize
+
         // Keep the original order, except that a moov which follows mdat moves
         // to just after the file type box.
         val order = boxes.filter { it !== moovBox }.toMutableList()
@@ -176,14 +192,29 @@ internal object AndroidMediaSanitizer {
         }
         require(mdatStart >= 0) { "Invalid MP4: mdat is not addressable" }
 
-        adjustMp4ChunkOffsets(moovBody, 0, moovBody.size, mdatStart - mdatBox.start, 0)
+        // Sample offsets point at the payload, so they follow both the box move
+        // and any header shrink.
+        val payloadShift =
+            (mdatStart + mdatHeaderSize) - (mdatBox.start + mdatBox.headerSize)
+        adjustMp4ChunkOffsets(moovBody, 0, moovBody.size, payloadShift, 0)
 
         for (box in order) {
-            if (box === moovBox) {
-                writeMp4BoxHeader(output, moovBox.type, moovBody.size.toLong())
-                output.write(moovBody)
-            } else {
-                copyMp4Box(container, output, box)
+            when {
+                box === moovBox -> {
+                    writeMp4BoxHeader(output, moovBox.type, moovBody.size.toLong())
+                    output.write(moovBody)
+                }
+                box === mdatBox && mdatHeaderSize != mdatBox.headerSize -> {
+                    writeMp4BoxHeader(output, mdatBox.type, mdatBodySize)
+                    copyMp4Box(
+                        container,
+                        output,
+                        box,
+                        start = box.start + box.headerSize,
+                        length = mdatBodySize,
+                    )
+                }
+                else -> copyMp4Box(container, output, box)
             }
         }
     }
@@ -355,10 +386,16 @@ internal object AndroidMediaSanitizer {
         output.write(header)
     }
 
-    private fun copyMp4Box(container: RandomAccessFile, output: OutputStream, box: Mp4Box) {
-        container.seek(box.start)
+    private fun copyMp4Box(
+        container: RandomAccessFile,
+        output: OutputStream,
+        box: Mp4Box,
+        start: Long = box.start,
+        length: Long = box.size,
+    ) {
+        container.seek(start)
         val buffer = ByteArray(MP4_COPY_BUFFER_BYTES)
-        var remaining = box.size
+        var remaining = length
         while (remaining > 0) {
             val count = minOf(buffer.size.toLong(), remaining).toInt()
             container.readFully(buffer, 0, count)
