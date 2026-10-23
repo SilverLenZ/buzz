@@ -8,6 +8,7 @@ import {
   isVoiceNoteFile,
   nextVoiceNotePlaybackRate,
   resolveAudioAttachment,
+  shouldReportPlaybackError,
   summarizeWaveform,
   VOICE_NOTE_MAX_DURATION_SECONDS,
   voiceNoteBarHeight,
@@ -168,4 +169,18 @@ test("resampling the summary matches pooling the raw samples", () => {
     Array.from(waveformPeaks(summary, 2)),
     Array.from(waveformPeaks(samples, 2)),
   );
+});
+
+test("a gesture-less play rejection does not mark the audio unavailable", () => {
+  // WebKit and Chromium reject playback that resumes after an async load; the
+  // bytes are fine, so the card must stay ready instead of showing an error.
+  assert.equal(shouldReportPlaybackError({ name: "NotAllowedError" }), false);
+  assert.equal(
+    shouldReportPlaybackError(
+      Object.assign(new Error("unsupported"), { name: "NotSupportedError" }),
+    ),
+    true,
+  );
+  assert.equal(shouldReportPlaybackError(new Error("boom")), true);
+  assert.equal(shouldReportPlaybackError(undefined), true);
 });

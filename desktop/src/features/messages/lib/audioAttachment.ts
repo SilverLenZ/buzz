@@ -59,6 +59,20 @@ export function resolveAudioAttachment(
   };
 }
 
+/**
+ * Whether a rejected `play()` means the attachment itself is unusable.
+ *
+ * WebKit and Chromium refuse playback started outside a user gesture. A click
+ * that lands while the bytes are still loading resumes playback from the fetch
+ * continuation, which carries no gesture, so the rejection says nothing about
+ * the audio. Reporting it as broken showed "Audio unavailable" on relay voice
+ * notes whose bytes were fine, and the retry button re-armed the same race.
+ */
+export function shouldReportPlaybackError(error: unknown): boolean {
+  const name = (error as { name?: unknown } | null | undefined)?.name;
+  return name !== "NotAllowedError";
+}
+
 export function formatVoiceNoteDuration(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
   const rounded = Math.floor(seconds);

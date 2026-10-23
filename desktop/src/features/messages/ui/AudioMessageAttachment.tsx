@@ -8,6 +8,7 @@ import {
   isVoiceNoteAttachment,
   nextVoiceNotePlaybackRate,
   resolveAudioAttachment,
+  shouldReportPlaybackError,
   summarizeWaveform,
   voiceNoteBarHeight,
   waveformPeaks,
@@ -325,8 +326,15 @@ export function AudioMessageAttachment({
     const audio = audioRef.current;
     if (!audio) return;
     window.dispatchEvent(new CustomEvent(PLAY_EVENT, { detail: playbackId }));
-    void audio.play().catch(() => {
+    void audio.play().catch((error: unknown) => {
       setIsPlaying(false);
+      if (!shouldReportPlaybackError(error)) {
+        // Refused for lack of a user gesture (playback began after the async
+        // load). Leave the card ready for the next click rather than claiming
+        // the audio is unavailable.
+        setPendingPlay(false);
+        return;
+      }
       setPlaybackError(true);
     });
   }, [playbackId]);
