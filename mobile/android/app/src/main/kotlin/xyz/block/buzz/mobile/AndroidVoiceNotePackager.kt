@@ -9,15 +9,45 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.util.UUID
 
+/**
+ * Parameters for the hidden black video track that carries a voice note's AAC
+ * audio into the relay's video upload pipeline.
+ *
+ * H.264 encoders do not have to accept arbitrarily small frames, and vendor
+ * media profiles (Samsung's, notably) declare minimum frame size, bit rate,
+ * and frame rate. An envelope smaller than those minimums configured on some
+ * devices but failed on others, which left the recording impossible to send.
+ * 176x144 (QCIF) is Android's documented SD baseline and the minimum those
+ * profiles advertise, so every encoder that can record video accepts it.
+ */
+internal val voiceNoteVideoEnvelope = VoiceNoteVideoEnvelope(
+    mimeType = "video/avc",
+    width = 176,
+    height = 144,
+    bitRate = 64_000,
+    frameRate = 15,
+)
+
+internal data class VoiceNoteVideoEnvelope(
+    val mimeType: String,
+    val width: Int,
+    val height: Int,
+    val bitRate: Int,
+    val frameRate: Int,
+)
+
 internal object AndroidVoiceNotePackager {
-    private const val videoMimeType = "video/avc"
-    private const val videoWidth = 16
-    private const val videoHeight = 16
-    private const val videoBitRate = 8_000
-    private const val videoFrameRate = 1
     private const val dequeueTimeoutUs = 10_000L
-    private const val encoderTimeoutNs = 30_000_000_000L
+    // Each encoder attempt gets half the previous single-attempt budget, so a
+    // hung hardware encoder still fails within the same total time.
+    private const val encoderTimeoutNs = 15_000_000_000L
     private const val copyBufferSize = 1024 * 1024
+
+    /**
+     * AOSP's software H.264 encoder, tried when the device's preferred encoder
+     * cannot configure the envelope.
+     */
+    private const val softwareVideoEncoderName = "c2.android.avc.encoder"
 
     fun packageForUpload(
         sourcePath: String,
@@ -44,7 +74,11 @@ internal object AndroidVoiceNotePackager {
             )
             // The relay rejects the `moov/meta` device box MediaMuxer always
             // writes, so the envelope is not uploadable until it is scrubbed.
-            AndroidMediaSanitizer.scrubMp4File(outputFile)
+            try {
+                AndroidMediaSanitizer.scrubMp4File(outputFile)
+            } catch (error: Exception) {
+                throw IllegalStateException("Unable to canonicalise voice note: $error", error)
+            }
             return outputFile.absolutePath
         } catch (error: Exception) {
             outputFile.delete()
@@ -85,11 +119,35 @@ internal object AndroidVoiceNotePackager {
         outputFile: File,
         durationUs: Long,
     ) {
-        val codec = MediaCodec.createEncoderByType(videoMimeType)
+        var failure: Exception? = null
+        for (codecName in listOf(null, softwareVideoEncoderName)) {
+            try {
+                writeBlackVideoTrack(outputFile, durationUs, codecName)
+                return
+            } catch (error: Exception) {
+                failure = error
+                outputFile.delete()
+            }
+        }
+        failure?.let { throw it }
+        throw IllegalStateException("Unable to create the voice note envelope.")
+    }
+
+    private fun writeBlackVideoTrack(
+        outputFile: File,
+        durationUs: Long,
+        codecName: String?,
+    ) {
+        val envelope = voiceNoteVideoEnvelope
+        val codec = if (codecName == null) {
+            MediaCodec.createEncoderByType(envelope.mimeType)
+        } else {
+            MediaCodec.createByCodecName(codecName)
+        }
         var muxer: MediaMuxer? = null
         try {
             val colorFormat = codec.codecInfo
-                .getCapabilitiesForType(videoMimeType)
+                .getCapabilitiesForType(envelope.mimeType)
                 .colorFormats
                 .firstOrNull {
                     it == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible ||
@@ -98,13 +156,13 @@ internal object AndroidVoiceNotePackager {
                 }
                 ?: throw IllegalStateException("This device cannot create the voice note envelope.")
             val format = MediaFormat.createVideoFormat(
-                videoMimeType,
-                videoWidth,
-                videoHeight,
+                envelope.mimeType,
+                envelope.width,
+                envelope.height,
             ).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
-                setInteger(MediaFormat.KEY_BIT_RATE, videoBitRate)
-                setInteger(MediaFormat.KEY_FRAME_RATE, videoFrameRate)
+                setInteger(MediaFormat.KEY_BIT_RATE, envelope.bitRate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, envelope.frameRate)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             }
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -203,7 +261,8 @@ internal object AndroidVoiceNotePackager {
     }
 
     private fun blackYuv420Frame(): ByteArray {
-        val yPlaneSize = videoWidth * videoHeight
+        val envelope = voiceNoteVideoEnvelope
+        val yPlaneSize = envelope.width * envelope.height
         return ByteArray(yPlaneSize * 3 / 2) { index ->
             if (index < yPlaneSize) 16 else 128.toByte()
         }

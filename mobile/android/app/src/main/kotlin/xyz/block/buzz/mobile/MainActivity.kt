@@ -11,6 +11,7 @@ import android.media.MediaExtractor
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.os.Build
+import android.util.Log
 import androidx.annotation.RequiresApi
 import com.google.android.play.agesignals.AgeSignalsException
 import com.google.android.play.agesignals.model.AgeSignalsErrorCode
@@ -465,10 +466,11 @@ class MainActivity : FlutterFragmentActivity() {
                     ),
                 )
             } catch (error: Exception) {
+                Log.e("BuzzVoiceNote", "voice note packaging failed", error)
                 result.error(
                     "transcode_failed",
                     "Unable to assemble voice note for upload.",
-                    error.message,
+                    error.toString(),
                 )
             }
         }.start()
