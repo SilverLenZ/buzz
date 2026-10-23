@@ -42,6 +42,9 @@ internal object AndroidVoiceNotePackager {
                 videoPath = videoFile.absolutePath,
                 outputPath = outputFile.absolutePath,
             )
+            // The relay rejects the `moov/meta` device box MediaMuxer always
+            // writes, so the envelope is not uploadable until it is scrubbed.
+            AndroidMediaSanitizer.scrubMp4File(outputFile)
             return outputFile.absolutePath
         } catch (error: Exception) {
             outputFile.delete()

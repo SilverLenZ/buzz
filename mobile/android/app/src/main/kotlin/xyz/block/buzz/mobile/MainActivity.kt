@@ -380,6 +380,9 @@ class MainActivity : FlutterFragmentActivity() {
                 }
 
                 muxer.stop()
+                // MediaMuxer always records a `moov/meta` device box that the
+                // relay rejects as a metadata channel.
+                AndroidMediaSanitizer.scrubMp4File(outputFile)
                 result.success(outputFile.absolutePath)
             } catch (e: Exception) {
                 outputFile.delete()
