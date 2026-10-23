@@ -48,4 +48,14 @@ class AndroidVoiceNotePackagerTest {
             envelopeDurationUs(declaredUs = 5_000_000L, measuredUs = 0L),
         )
     }
+
+    @Test
+    fun `audio duration counts frames instead of trusting timestamps`() {
+        // The recorder writes timestamps at half rate: this take's 583 frames
+        // carry 13.537 s of audio but declare 27.074 s, which is what every
+        // player was showing before the envelope stopped using the header.
+        assertEquals(13_537_233L, audioDurationFromFrameCountUs(frames = 583, sampleRate = 44_100))
+        assertEquals(0L, audioDurationFromFrameCountUs(frames = 0, sampleRate = 44_100))
+        assertEquals(0L, audioDurationFromFrameCountUs(frames = 583, sampleRate = 0))
+    }
 }

@@ -51,9 +51,22 @@ internal fun envelopeDurationUs(
     measuredUs: Long,
 ): Long = if (measuredUs > 0) measuredUs else declaredUs
 
+/** Samples carried by one AAC-LC frame, which is what Android's encoder emits. */
+internal const val AAC_FRAME_SAMPLES = 1024L
+
+/**
+ * Audio length implied by an AAC frame count at [sampleRate].
+ *
+ * Counting frames is the only duration signal the recorder cannot distort:
+ * its timestamps are written at half rate, so a ten second take reports 21.5 s.
+ */
+internal fun audioDurationFromFrameCountUs(frames: Long, sampleRate: Int): Long {
+    if (frames <= 0 || sampleRate <= 0) return 0L
+    return frames * AAC_FRAME_SAMPLES * 1_000_000L / sampleRate
+}
+
 internal object AndroidVoiceNotePackager {
     private const val sampleWalkBufferSize = 64 * 1024
-    private const val aacFrameSamples = 1024L
 
     private const val dequeueTimeoutUs = 10_000L
     // Each encoder attempt gets half the previous single-attempt budget, so a
@@ -130,7 +143,7 @@ internal object AndroidVoiceNotePackager {
                 } else {
                     0
                 }
-                val measuredUs = measureSampleTimelineUs(extractor, index, sampleRate)
+                val measuredUs = measureSampleDurationUs(extractor, index, sampleRate)
                 return AudioTrack(index, envelopeDurationUs(declaredUs, measuredUs), mimeType)
             }
             throw IllegalArgumentException("The recording does not contain an audio track.")
@@ -140,27 +153,31 @@ internal object AndroidVoiceNotePackager {
     }
 
     /**
-     * End of the audio the file actually plays: the last sample's timestamp
-     * plus one AAC frame, read from the sample table rather than the header.
+     * Length of the audio the file holds, counted from its AAC frames.
+     *
+     * The sample *timestamps* cannot be trusted here: the recorder writes them
+     * at half rate, so a ten second take reports 21.5 s of timestamps for 10.8 s
+     * of frames, which is the doubled length every player was showing. Counting
+     * frames and applying the declared sample rate measures the audio itself.
      *
      * Returns 0 when the track has no readable samples, so the caller can fall
      * back to the declared duration.
      */
-    private fun measureSampleTimelineUs(
+    private fun measureSampleDurationUs(
         extractor: MediaExtractor,
         trackIndex: Int,
         sampleRate: Int,
     ): Long {
+        if (sampleRate <= 0) return 0L
         extractor.selectTrack(trackIndex)
         val buffer = ByteBuffer.allocate(sampleWalkBufferSize)
-        var lastSampleUs = -1L
+        var frames = 0L
         while (true) {
             if (extractor.readSampleData(buffer, 0) < 0) break
-            lastSampleUs = extractor.sampleTime
+            frames += 1
             if (!extractor.advance()) break
         }
-        if (lastSampleUs < 0 || sampleRate <= 0) return 0L
-        return lastSampleUs + aacFrameSamples * 1_000_000L / sampleRate
+        return audioDurationFromFrameCountUs(frames, sampleRate)
     }
 
     private fun writeBlackVideoTrack(
